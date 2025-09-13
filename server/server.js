@@ -6,6 +6,17 @@ const { Server } = require("socket.io");
 
 const app = express();
 
+app.get('/', (req, res) => {
+  res.send('H2N Forum server OK');
+});
+
+app.get('/healthz', (req, res) => {
+  res.json({ ok: true, time: new Date().toISOString() });
+});
+
+// temporary test endpoint
+app.get('/__ping', (req, res) => res.send('pong'));
+
 // CORS: allow your dev client(s)
 const allowedOrigins = (process.env.CLIENT_ORIGIN || "")
   .split(",")
