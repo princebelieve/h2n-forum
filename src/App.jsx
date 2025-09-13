@@ -2,8 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import "./App.css";
 
-const SERVER_URL =
-  import.meta.env.VITE_SERVER_URL?.split(",")[0]?.trim() || "http://localhost:3001";
+const SERVER_URL = import.meta.env.VITE_SERVER_URL.split(",")[0].trim();
 
 export default function App() {
   const sref = useRef(null);
@@ -107,7 +106,7 @@ export default function App() {
     <div className="shell">
       <div className="glass">
         <header className="head">
-          <h1>H2N Chatroom</h1>
+          <h1>H2N Forum</h1>
           <span className={`pill ${connected ? "ok" : ""}`}>
             {connected ? "Connected to server" : "Disconnected"}
           </span>
