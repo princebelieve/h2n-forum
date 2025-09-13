@@ -38,7 +38,6 @@ export default function App() {
     socket.on("connect", () => setConnected(true));
     socket.on("disconnect", () => setConnected(false));
 
-    // Accept multiple possible server event names defensively
     const pushMsg = (m) =>
       setMsgs((prev) => [...prev, normalizeMsg(m)]);
 
@@ -46,11 +45,12 @@ export default function App() {
     socket.on("message", pushMsg);
     socket.on("server:msg", pushMsg);
 
-    // room/system notes (defensive)
-    const sys = (t) => setMsgs((p) => [...p, { system: true, text: t, ts: Date.now() }]);
-    socket.on("room:joined", ({ roomId }) => sys(Joined room ${roomId}));
-    socket.on("joined", ({ roomId }) => sys(Joined room ${roomId}));
-    socket.on("room:created", ({ roomId }) => sys(Room ${roomId} created));
+    const sys = (t) =>
+      setMsgs((p) => [...p, { system: true, text: t, ts: Date.now() }]);
+
+    socket.on("room:joined", ({ roomId }) => sys(`Joined room ${roomId}`));
+    socket.on("joined", ({ roomId }) => sys(`Joined room ${roomId}`));
+    socket.on("room:created", ({ roomId }) => sys(`Room ${roomId} created`));
 
     return () => {
       socket.off("chat:msg", pushMsg);
@@ -65,7 +65,6 @@ export default function App() {
 
   // Normalize message shape for UI
   function normalizeMsg(m) {
-    // try common shapes
     if (typeof m === "string") return { text: m, ts: Date.now() };
     if (m && m.text) return { ...m, ts: m.ts || Date.now() };
     if (m && m.message) return { text: m.message, ts: m.ts || Date.now() };
@@ -86,7 +85,6 @@ export default function App() {
     const socket = sref.current;
     if (!socket) return;
 
-    // defensive emits (use whatever your server handles)
     socket.emit("room:create", { roomId: code, pin: pin || undefined, name: name || undefined });
     socket.emit("join", { roomId: code, pin: pin || undefined, name: name || undefined });
     socket.emit("room:join", { roomId: code, pin: pin || undefined, name: name || undefined });
@@ -105,7 +103,7 @@ export default function App() {
   }
 
   // -----------------------------
-  // Chat send (defensive emit)
+  // Chat send
   // -----------------------------
   function sendMsg() {
     const t = text.trim();
@@ -127,7 +125,6 @@ export default function App() {
     socket.emit("chat:send", payload);
     socket.emit("message", payload);
 
-    // also show locally
     setMsgs((prev) => [...prev, { ...payload, me: true }]);
     setText("");
   }
@@ -206,10 +203,8 @@ export default function App() {
     const socket = sref.current;
     const pc = ensurePeerConnection();
 
-    // join signaling channel
     socket?.emit("rtc:join", { roomId: roomName });
 
-    // create offer
     const offer = await pc.createOffer({ offerToReceiveAudio: true });
     await pc.setLocalDescription(offer);
     socket?.emit("rtc:offer", { roomId: roomName, offer });
@@ -250,7 +245,7 @@ export default function App() {
     const socket = sref.current;
     if (!socket) return;
 
-    const onOffer = async ({ from, offer }) => {
+    const onOffer = async ({ offer }) => {
       try {
         if (!micReady) await startMic();
         const pc = ensurePeerConnection();
@@ -264,7 +259,7 @@ export default function App() {
       }
     };
 
-    const onAnswer = async ({ from, answer }) => {
+    const onAnswer = async ({ answer }) => {
       try {
         const pc = ensurePeerConnection();
         await pc.setRemoteDescription(new RTCSessionDescription(answer));
@@ -273,7 +268,7 @@ export default function App() {
       }
     };
 
-    const onIce = async ({ from, candidate }) => {
+    const onIce = async ({ candidate }) => {
       try {
         const pc = ensurePeerConnection();
         await pc.addIceCandidate(new RTCIceCandidate(candidate));
@@ -282,31 +277,15 @@ export default function App() {
       }
     };
 
-    const onPeerJoined = () => {
-      // Optional: show a system message
-      setMsgs((p) => [...p, { system: true, text: "Peer joined voice", ts: Date.now() }]);
-    };
-    const onPeerLeft = () => {
-      setMsgs((p) => [...p, { system: true, text: "Peer left voice", ts: Date.now() }]);
-      // stop only remote playback
-      if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
-      setCalling(false);
-    };
-
     socket.on("rtc:offer", onOffer);
     socket.on("rtc:answer", onAnswer);
     socket.on("rtc:ice", onIce);
-    socket.on("rtc:peer-joined", onPeerJoined);
-    socket.on("rtc:peer-left", onPeerLeft);
 
     return () => {
       socket.off("rtc:offer", onOffer);
       socket.off("rtc:answer", onAnswer);
       socket.off("rtc:ice", onIce);
-      socket.off("rtc:peer-joined", onPeerJoined);
-      socket.off("rtc:peer-left", onPeerLeft);
     };
-    // re-bind when roomName/micReady changes
   }, [roomName, micReady]);
 
   // -----------------------------
@@ -314,9 +293,15 @@ export default function App() {
   // -----------------------------
   return (
     <div className="app">
-      <h1>H2N Forum
-        {connected ? <span className="status">Connected to server</span>
-                   : <span className="status" style={{ color: "#fca5a5" }}>Disconnected</span>}
+      <h1>
+        H2N Forum{" "}
+        {connected ? (
+          <span className="status">Connected to server</span>
+        ) : (
+          <span className="status" style={{ color: "#fca5a5" }}>
+            Disconnected
+          </span>
+        )}
       </h1>
 
       <div className="panel">
@@ -329,7 +314,9 @@ export default function App() {
               onChange={(e) => setName(e.target.value)}
             />
             <div className="row_title">Create a meeting</div>
-            <button className="btn" onClick={createRoom}>Create Meeting</button>
+            <button className="btn" onClick={createRoom}>
+              Create Meeting
+            </button>
             {roomName && <div className="pill">Room: {roomName}</div>}
           </div>
 
@@ -346,14 +333,16 @@ export default function App() {
               onChange={(e) => setPin(e.target.value)}
             />
             <div className="row_title_right">Join a meeting</div>
-            <button className="btn" onClick={joinRoom}>Join</button>
+            <button className="btn" onClick={joinRoom}>
+              Join
+            </button>
           </div>
         </div>
 
         {/* Messages */}
         <div className="msgs">
           {msgs.map((m, i) => (
-            <div key={i} className={msg ${m.me ? "me" : ""}}>
+            <div key={i} className={`msg ${m.me ? "me" : ""}`}>
               {!m.system && <div className="meta">{m.from || "Someone"}</div>}
               <div>{m.text}</div>
             </div>
@@ -366,9 +355,16 @@ export default function App() {
             placeholder="Type a message…"
             value={text}
             onChange={(e) => setText(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMsg(); } }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                sendMsg();
+              }
+            }}
           />
-          <button className="btn" onClick={sendMsg}>Send</button>
+          <button className="btn" onClick={sendMsg}>
+            Send
+          </button>
         </div>
 
         {/* Voice controls */}
@@ -387,7 +383,6 @@ export default function App() {
           </button>
         </div>
 
-        {/* Hidden audio element for remote voice */}
         <audio ref={remoteAudioRef} autoPlay playsInline style={{ display: "none" }} />
       </div>
     </div>
