@@ -119,3 +119,11 @@ server.listen(PORT, () => {
   console.log(`H2N Forum server running on http://localhost:${PORT}`);
   console.log("Allowed CORS origins:", allowedOrigins.join(", ") || "(any)");
 });
+
+app.get('/', (req, res) => {
+  res.send('H2N Forum server OK');
+});
+
+app.get('/healthz', (req, res) => {
+  res.json({ ok: true, time: new Date().toISOString() });
+});
