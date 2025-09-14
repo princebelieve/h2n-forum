@@ -149,3 +149,4 @@ input::placeholder, textarea::placeholder { color: #68819e; }
   .send textarea { height: 64px; }
 }
 
+.btn.danger { background:#dc2626; color:#fff; }
