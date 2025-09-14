@@ -54,6 +54,29 @@ io.on("connection", (socket) => {
     if (typeof name === "string" && name.trim()) socket.data.name = name.trim();
   });
 
+  // --- WebRTC signaling (voice) ---
+socket.on("rtc:join", ({ roomId }) => {
+  socket.join(roomId);
+  socket.to(roomId).emit("rtc:peer-joined", { peerId: socket.id });
+});
+
+socket.on("rtc:leave", ({ roomId }) => {
+  socket.leave(roomId);
+  socket.to(roomId).emit("rtc:peer-left", { peerId: socket.id });
+});
+
+socket.on("rtc:offer", ({ roomId, offer }) => {
+  socket.to(roomId).emit("rtc:offer", { from: socket.id, offer });
+});
+
+socket.on("rtc:answer", ({ roomId, answer }) => {
+  socket.to(roomId).emit("rtc:answer", { from: socket.id, answer });
+});
+
+socket.on("rtc:ice", ({ roomId, candidate }) => {
+  socket.to(roomId).emit("rtc:ice", { from: socket.id, candidate });
+});
+
   /** Create room */
   socket.on("create-room", ({ name, pin } = {}, ack) => {
     const code = six();
