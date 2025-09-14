@@ -1,40 +1,49 @@
+// src/App.jsx
 import { useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import "./App.css";
 
+// Read server URL from Netlify/ENV
 const SERVER_URL = (import.meta.env.VITE_API_URL || "").split(",")[0].trim();
 
-export default function App() {
-  const sref = useRef(null);
+// Use valid ICE servers (no ?transport=udp here)
+const ICE_SERVERS = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:global.stun.twilio.com:3478" },
+  // Add TURN later if needed, e.g. { urls: "turn:...", username: "...", credential: "..." }
+];
 
-  // connection
+export default function App() {
+  /** Socket **/
+  const sref = useRef(null);
   const [connected, setConnected] = useState(false);
 
-  // identity
+  /** Identity & room **/
   const [me, setMe] = useState("Me");
-
-  // create
-  const [roomName, setRoomName] = useState("");
+  const [room, setRoom] = useState(null);          // {code,name,requiresPin}
+  const [roomName, setRoomName] = useState("");    // create
   const [pin, setPin] = useState("");
-
-  // join
-  const [joinCode, setJoinCode] = useState("");
+  const [joinCode, setJoinCode] = useState("");    // join
   const [joinPin, setJoinPin] = useState("");
 
-  // room & chat
-  const [room, setRoom] = useState(null); // {code,name,requiresPin}
+  /** Chat **/
   const [text, setText] = useState("");
   const [msgs, setMsgs] = useState([]);
   const addMsg = (m) => setMsgs((p) => [...p, m]);
 
-  // --- WebRTC state ---
+  /** Media / WebRTC **/
   const pcRef = useRef(null);
   const localStreamRef = useRef(null);
-  const remoteStreamRef = useRef(null);
+  const [inCall, setInCall] = useState(false);
+  const [incomingOffer, setIncomingOffer] = useState(null); // offer from peer
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
-  const [calling, setCalling] = useState(false);
 
+  /** Ringtones **/
+  const ringElRef = useRef(null);     // incoming
+  const ringbackElRef = useRef(null); // caller side
+
+  /* -------------------- socket connection -------------------- */
   useEffect(() => {
     const s = io(SERVER_URL, { transports: ["websocket"] });
     sref.current = s;
@@ -44,36 +53,32 @@ export default function App() {
       s.emit("hello", me);
       addMsg({ sys: true, ts: Date.now(), text: "Socket connected" });
     });
+
     s.on("disconnect", () => {
       setConnected(false);
       addMsg({ sys: true, ts: Date.now(), text: "Socket disconnected" });
     });
+
     s.on("chat", (m) => addMsg(m));
 
-    // --- signaling for WebRTC ---
-    s.on("rtc:peer-joined", () => {
-      if (pcRef.current && calling) makeOffer(); // renegotiate if needed
+    // ---- WebRTC signaling: receive offer/answer/ice ----
+    s.on("rtc:offer", async ({ from, offer }) => {
+      setIncomingOffer({ from, offer });
+      // play incoming ring
+      try { ringElRef.current?.play(); } catch {}
     });
 
-    s.on("rtc:offer", async ({ offer }) => {
-      ensurePeer();
-      await pcRef.current.setRemoteDescription(offer);
-      const answer = await pcRef.current.createAnswer();
-      await pcRef.current.setLocalDescription(answer);
-      sref.current.emit("rtc:answer", { roomId: room?.code, answer });
+    s.on("rtc:answer", async ({ from, answer }) => {
+      await pcRef.current?.setRemoteDescription(answer).catch(console.error);
     });
 
-    s.on("rtc:answer", async ({ answer }) => {
-      if (!pcRef.current) return;
-      await pcRef.current.setRemoteDescription(answer);
-    });
-
-    s.on("rtc:ice", async ({ candidate }) => {
+    s.on("rtc:ice", async ({ from, candidate }) => {
+      if (!pcRef.current || !candidate) return;
       try {
-        if (pcRef.current && candidate) {
-          await pcRef.current.addIceCandidate(candidate);
-        }
-      } catch {}
+        await pcRef.current.addIceCandidate(candidate);
+      } catch (e) {
+        console.error("addIceCandidate error:", e);
+      }
     });
 
     return () => s.disconnect();
@@ -84,6 +89,7 @@ export default function App() {
     sref.current?.emit("hello", me);
   }, [me]);
 
+  /* -------------------- room actions -------------------- */
   const createRoom = () => {
     sref.current?.emit("create-room", { name: roomName, pin }, (res) => {
       if (!res?.ok) {
@@ -91,13 +97,11 @@ export default function App() {
         return;
       }
       setRoom(res.room);
-      setJoinCode(res.room.code);
       addMsg({
         sys: true,
         ts: Date.now(),
         text: `Created room: ${res.room.name} (${res.room.code})`,
       });
-      sref.current.emit("rtc:join", { roomId: res.room.code });
     });
   };
 
@@ -120,15 +124,13 @@ export default function App() {
           ts: Date.now(),
           text: `Joined room: ${res.room.name} (${res.room.code})`,
         });
-        sref.current.emit("rtc:join", { roomId: res.room.code });
       }
     );
   };
 
   const leaveRoom = () => {
-    stopCall(); // hang up if calling
     sref.current?.emit("leave-room");
-    sref.current?.emit("rtc:leave", { roomId: room?.code });
+    endCall(); // also hang up if in call
     setRoom(null);
     addMsg({ sys: true, ts: Date.now(), text: "Left room" });
   };
@@ -140,20 +142,27 @@ export default function App() {
     setText("");
   };
 
-  // ---------- WebRTC helpers ----------
-  function ensurePeer() {
-    if (pcRef.current) return pcRef.current;
-    const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: "stun:stun.l.google.com:19302" },
-        { urls: "stun:global.stun.twilio.com:3478?transport=udp" },
-      ],
+  /* -------------------- webrtc helpers -------------------- */
+  async function ensureLocalStream() {
+    if (localStreamRef.current) return localStreamRef.current;
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: true,
     });
-    pcRef.current = pc;
+    localStreamRef.current = stream;
+    if (localVideoRef.current) {
+      localVideoRef.current.srcObject = stream;
+      try { await localVideoRef.current.play(); } catch {}
+    }
+    return stream;
+  }
+
+  function newPeer() {
+    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
     pc.onicecandidate = (e) => {
       if (e.candidate) {
-        sref.current.emit("rtc:ice", {
+        sref.current?.emit("rtc:ice", {
           roomId: room?.code,
           candidate: e.candidate,
         });
@@ -161,61 +170,104 @@ export default function App() {
     };
 
     pc.ontrack = (e) => {
-      const [stream] = e.streams;
-      remoteStreamRef.current = stream;
-      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = stream;
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = e.streams[0];
+        remoteVideoRef.current.play().catch(() => {});
+      }
     };
 
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "connected") {
+        stopRingback();
+        setInCall(true);
+      }
+      if (pc.connectionState === "disconnected" || pc.connectionState === "failed" || pc.connectionState === "closed") {
+        stopRing();
+        stopRingback();
+        setInCall(false);
+      }
+    };
+
+    pcRef.current = pc;
     return pc;
   }
 
-  async function makeOffer() {
-    const pc = ensurePeer();
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    sref.current.emit("rtc:offer", { roomId: room?.code, offer });
+  function stopRing() {
+    const el = ringElRef.current;
+    if (!el) return;
+    try { el.pause(); el.currentTime = 0; } catch {}
+  }
+  function stopRingback() {
+    const el = ringbackElRef.current;
+    if (!el) return;
+    try { el.pause(); el.currentTime = 0; } catch {}
   }
 
+  /* -------------------- call actions -------------------- */
   const startCall = async () => {
-    if (!room) {
+    if (!room?.code) {
       addMsg({ sys: true, ts: Date.now(), text: "Join or create a room first." });
       return;
     }
+    const stream = await ensureLocalStream();
+    const pc = newPeer();
+    stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+
+    // Caller plays ringback until connected
+    try { ringbackElRef.current?.play(); } catch {}
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    sref.current?.emit("rtc:offer", { roomId: room.code, offer });
+  };
+
+  const answerCall = async () => {
+    const incoming = incomingOffer;
+    if (!incoming) return;
+
+    stopRing();
+    const stream = await ensureLocalStream();
+    const pc = newPeer();
+    stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+
+    await pc.setRemoteDescription(incoming.offer);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    sref.current?.emit("rtc:answer", { roomId: room?.code, answer });
+    setIncomingOffer(null);
+  };
+
+  const declineCall = () => {
+    stopRing();
+    setIncomingOffer(null);
+    // No signal needed; the caller will time out / stay ringing until they hang up
+  };
+
+  const endCall = () => {
+    stopRing();
+    stopRingback();
+    setInCall(false);
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-      localStreamRef.current = stream;
-      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+      pcRef.current?.getSenders().forEach((s) => s.track && s.track.stop());
+      pcRef.current?.close();
+    } catch {}
+    pcRef.current = null;
 
-      const pc = ensurePeer();
-      stream.getTracks().forEach((t) => pc.addTrack(t, stream));
-
-      setCalling(true);
-      await makeOffer();
-      addMsg({ sys: true, ts: Date.now(), text: "Calling…" });
-    } catch (err) {
-      addMsg({ sys: true, ts: Date.now(), text: `Cannot start call: ${err.message}` });
+    // keep local preview off after hang-up
+    if (localVideoRef.current) {
+      localVideoRef.current.srcObject = null;
     }
   };
 
-  const stopCall = () => {
-    setCalling(false);
-    try {
-      localStreamRef.current?.getTracks()?.forEach((t) => t.stop());
-    } catch {}
-    localStreamRef.current = null;
-    if (localVideoRef.current) localVideoRef.current.srcObject = null;
-    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
-
-    try { pcRef.current?.getSenders()?.forEach((s) => s.track && s.track.stop()); } catch {}
-    try { pcRef.current?.close(); } catch {}
-    pcRef.current = null;
-
-    if (room?.code) sref.current.emit("rtc:leave", { roomId: room.code });
-  };
-
+  /* -------------------- UI -------------------- */
   return (
     <div className="shell">
       <div className="glass">
+        {/* hidden audio elements for tones */}
+        <audio id="incoming-audio" ref={ringElRef} src="/sounds/incoming.mp3" preload="auto" />
+        <audio id="ringback-audio" ref={ringbackElRef} src="/sounds/ringback.mp3" preload="auto" />
+
         <header className="head">
           <h1>H2N Forum</h1>
           <span className={`pill ${connected ? "ok" : ""}`}>
@@ -229,8 +281,8 @@ export default function App() {
         </div>
 
         <div className="row">
-          <label>Your name</label>
-          <input value={me} onChange={(e) => setMe(e.target.value)} />
+          <label>Name</label>
+          <input value={me} onChange={(e) => setMe(e.target.value)} placeholder="Your display name" />
         </div>
 
         {/* create / join */}
@@ -239,7 +291,7 @@ export default function App() {
             <div className="row title">Create a meeting</div>
             <div className="row">
               <input
-                placeholder="Family Room (optional)"
+                placeholder="Room name (optional)"
                 value={roomName}
                 onChange={(e) => setRoomName(e.target.value)}
               />
@@ -249,11 +301,11 @@ export default function App() {
                 onChange={(e) => setPin(e.target.value)}
               />
               <button className="btn primary" onClick={createRoom}>
-                Create Meeting
+                Create
               </button>
             </div>
 
-            <div className="row title right">Code + optional PIN</div>
+            <div className="row title right">Join with code</div>
             <div className="row">
               <input
                 placeholder="6-digit code"
@@ -269,11 +321,6 @@ export default function App() {
                 Join
               </button>
             </div>
-
-            <div className="hint">
-              Rooms auto-delete after being empty for a while. Share the
-              6-digit code (and PIN if set).
-            </div>
           </>
         )}
 
@@ -283,27 +330,50 @@ export default function App() {
               <div className="inroom">
                 In room: <b>{room.name}</b>{" "}
                 <span className="mono">({room.code})</span>
-                <button className="link" onClick={leaveRoom}>Leave</button>
-              </div>
-
-              <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
-                {!calling ? (
-                  <button className="btn primary" onClick={startCall}>Start Call</button>
-                ) : (
-                  <button className="btn danger" onClick={stopCall}>Hang Up</button>
-                )}
+                <button className="link" onClick={leaveRoom}>
+                  Leave
+                </button>
               </div>
             </div>
 
-            {/* videos */}
-            <div className="row" style={{ gap: 12 }}>
-              <div style={{ flex: 1 }}>
-                <div className="mono small">You</div>
-                <video ref={localVideoRef} autoPlay muted playsInline style={{ width: "100%", background: "#111", borderRadius: 8, aspectRatio: "16/9" }} />
-              </div>
-              <div style={{ flex: 1 }}>
-                <div className="mono small">Peer</div>
-                <video ref={remoteVideoRef} autoPlay playsInline style={{ width: "100%", background: "#111", borderRadius: 8, aspectRatio: "16/9" }} />
+            {/* Call controls */}
+            <div className="row">
+              {!inCall && !incomingOffer && (
+                <button className="btn primary" onClick={startCall}>Start call</button>
+              )}
+              {incomingOffer && !inCall && (
+                <>
+                  <button className="btn primary" onClick={answerCall}>Answer</button>
+                  <button className="btn" onClick={declineCall}>Decline</button>
+                </>
+              )}
+              {inCall && (
+                <button className="btn danger" onClick={endCall}>Hang up</button>
+              )}
+            </div>
+
+            {/* Videos */}
+            <div className="row">
+              <div style={{display:"grid", gap:"12px", width:"100%"}}>
+                <div>
+                  <div className="mono small">You</div>
+                  <video
+                    ref={localVideoRef}
+                    muted
+                    playsInline
+                    autoPlay
+                    style={{ width: "100%", background: "#000", borderRadius: 8 }}
+                  />
+                </div>
+                <div>
+                  <div className="mono small">Peer</div>
+                  <video
+                    ref={remoteVideoRef}
+                    playsInline
+                    autoPlay
+                    style={{ width: "100%", background: "#000", borderRadius: 8 }}
+                  />
+                </div>
               </div>
             </div>
           </>
@@ -319,9 +389,7 @@ export default function App() {
                 {!m.sys && (
                   <div className="meta">
                     <span className="who">{m.name}</span>
-                    <span className="ts">
-                      {new Date(m.ts).toLocaleTimeString()}
-                    </span>
+                    <span className="ts">{new Date(m.ts).toLocaleTimeString()}</span>
                   </div>
                 )}
                 <div className="text">{m.text}</div>
@@ -342,7 +410,9 @@ export default function App() {
               }
             }}
           />
-          <button className="btn primary" onClick={sendChat}>Send</button>
+          <button className="btn primary" onClick={sendChat}>
+            Send
+          </button>
         </div>
       </div>
     </div>
