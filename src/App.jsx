@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import "./App.css";
 
-const SERVER_URL = import.meta.env.VITE_SERVER_URL.split(",")[0].trim();
+const SERVER_URL = (import.meta.env.VITE_API_URL || "").split(",")[0].trim();
 
 export default function App() {
   const sref = useRef(null);

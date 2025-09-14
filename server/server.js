@@ -10,11 +10,11 @@ const app = express();
 /* ---------------------------
    Health / basic endpoints
 ---------------------------- */
-app.get("/", (req, res) => {
+app.get("/", (_req, res) => {
   res.send("H2N Forum server OK");
 });
 
-app.get("/healthz", (req, res) => {
+app.get("/healthz", (_req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
@@ -29,14 +29,13 @@ const allowedList = (process.env.CLIENT_ORIGIN || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
-/** Allow same-origin/no-origin (curl), explicit list, and Netlify previews */
+/** Allow same-origin/no-origin (curl), explicit list, and Netlify/Render previews */
 function allowOrigin(origin) {
-  if (!origin) return true; // same-origin, curl, etc.
+  if (!origin) return true; // same-origin, curl, server-to-server
   try {
     const { hostname } = new URL(origin);
-    // Allow Netlify preview domains and your Render app domain
-    if (hostname.endsWith(".netlify.app")) return true;
-    if (hostname.endsWith(".onrender.com")) return true;
+    if (hostname.endsWith(".netlify.app")) return true; // Netlify previews
+    if (hostname.endsWith(".onrender.com")) return true; // Render domain
     return allowedList.includes(origin);
   } catch {
     return false;
@@ -101,7 +100,7 @@ io.on("connection", (socket) => {
     io.to(code).emit("chat", {
       sys: true,
       ts: Date.now(),
-      text: Created room: ${room.name} (${code}),
+      text: `Created room: ${room.name} (${code})`,
     });
   });
 
@@ -123,7 +122,7 @@ io.on("connection", (socket) => {
     io.to(room.code).emit("chat", {
       sys: true,
       ts: Date.now(),
-      text: ${socket.data.name} joined,
+      text: `${socket.data.name} joined`,
     });
   });
 
@@ -136,7 +135,7 @@ io.on("connection", (socket) => {
     io.to(code).emit("chat", {
       sys: true,
       ts: Date.now(),
-      text: ${socket.data.name} left,
+      text: `${socket.data.name} left`,
     });
     // Delete empty rooms after 30s
     setTimeout(async () => {
@@ -214,7 +213,7 @@ io.on("connection", (socket) => {
 ---------------------------- */
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(H2N Forum server running on http://localhost:${PORT});
+  console.log(`H2N Forum server running on http://localhost:${PORT}`);
   console.log(
     "Allowed CORS origins:",
     allowedList.length ? allowedList.join(", ") : "(Netlify/Render + any if same-origin)"
