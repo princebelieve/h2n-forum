@@ -1,174 +1,188 @@
-/* --- H2N Forum: simple WhatsApp-ish navy theme --- */
 :root{
-  --bg: #0b1a2b;        /* dark navy */
-  --panel: #12243a;     /* card/navy */
-  --accent: #2f7cf6;    /* blue */
-  --accent-2: #1cc8a0;  /* teal for OK pills */
-  --text: #e8eef7;      /* near-white */
-  --muted: #9fb3c8;     /* muted text */
-  --bubble: #183251;    /* message bubble */
-  --sys: #2b3f5e;       /* system bubble */
-  --border: #1b3553;
-  --danger: #ff6b6b;
-  --shadow: 0 10px 24px rgba(0,0,0,.35);
+  --bg:#0c1624;        /* darker page background */
+  --panel:#0f223a;     /* card/navy */
+  --text:#eaf2ff;
+  --muted:#9db3cf;
+  --accent:#2f7bff;
+  --danger:#ff4d4d;
+  --ok:#28c76f;
+  --chip:#173154;
 }
 
-*{ box-sizing: border-box; }
+*{ box-sizing:border-box; }
 html,body,#root{ height:100%; }
 body{
-  margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-  background: var(--bg); color: var(--text);
+  margin:0;
+  background: var(--bg);
+  color:var(--text);
+  font: 16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial,"Noto Sans","Liberation Sans",sans-serif;
 }
 
-/* Shell + panel */
-.shell{ max-width: 980px; margin: 24px auto; padding: 12px; }
+.shell{
+  min-height:100%;
+  display:flex;
+  align-items:flex-start;
+  justify-content:center;
+  padding:24px 12px 64px;
+}
+
 .glass{
+  width:100%;
+  max-width:980px;
   background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 16px;
-  box-shadow: var(--shadow);
-  padding: 16px;
+  border:1px solid #1e3457;
+  border-radius:18px;
+  padding:16px;
+  box-shadow: 0 18px 50px #0009;  /* subtle, no yellow ring */
 }
 
-/* Header */
-.head{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom: 12px; }
-.head h1{ font-size: 22px; margin:0; letter-spacing:.3px; }
+.head{
+  display:flex;
+  align-items:center;
+  gap:12px;
+  margin-bottom:8px;
+}
+.head h1{
+  font-size:28px;
+  margin:0;
+  letter-spacing:.3px;
+}
 .pill{
-  padding:6px 10px; border-radius:999px; font-size:12px;
-  background:#2a3750; color:var(--muted); border:1px solid var(--border);
+  margin-left:auto;
+  padding:6px 10px;
+  border-radius:999px;
+  background: #1f3b60;
+  color:#cfe1ff;
+  font-size:12px;
 }
-.pill.ok{ background:#133b38; color:#c9fff3; border-color:#18554d; }
+.pill.ok{ background:#1b5138; color:#c9f5dd; }
 
-/* Rows & inputs */
-.row{ display:flex; gap:10px; align-items:center; margin:10px 0; flex-wrap:wrap; }
-.row.title{ font-weight:600; margin-top:16px; }
-.row.right{ justify-content:flex-end; }
+.row{
+  display:flex;
+  gap:10px;
+  align-items:center;
+  margin:10px 0;
+}
+.row.title{ font-weight:600; opacity:.9; }
+.row.title.right{ justify-content:flex-end; }
 
-.mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-.small{ font-size:12px; color:var(--muted); }
-
-label{ width:120px; color:var(--muted); }
+label{ width:110px; color:var(--muted); }
 
 input, textarea{
-  flex:1; min-width: 140px;
-  background:#0e1e33; color:var(--text);
-  border:1px solid var(--border);
-  border-radius:10px; padding:10px 12px;
-  outline:none;
-}
-input:focus, textarea:focus{ border-color:#326bdc; }
-
-/* Buttons */
-.btn{
-  background:#243c66; color:white; border:1px solid #2a4a86;
-  padding:10px 14px; border-radius:12px; cursor:pointer; font-weight:600;
-}
-.btn:hover{ filter:brightness(1.05); }
-.btn.primary{ background: var(--accent); border-color:#1e56ce; }
-.btn.danger{ background: var(--danger); border-color:#e75757; }
-.link{ background:transparent; border:none; color:#8ab7ff; cursor:pointer; padding:0 6px; }
-
-/* Messages area */
-.msgs{
-  background: #0e1e33;
-  border:1px solid var(--border);
+  flex:1;
+  background:#0b1a2b;
+  border:1px solid #294872;
   border-radius:12px;
-  height: 42vh;            /* roomy on desktop */
-  overflow:auto; padding:10px;
+  color:var(--text);
+  padding:10px 12px;
+}
+input::placeholder, textarea::placeholder{ color:#7695bd; }
+
+textarea{
+  min-height:3.6em; /* ~3 lines */
+  resize:vertical;
+}
+
+.btn{
+  background:#193055;
+  border:1px solid #2b4c7e;
+  color:var(--text);
+  padding:10px 14px;
+  border-radius:12px;
+  cursor:pointer;
+}
+.btn:hover{ filter:brightness(1.06); }
+.btn:disabled{ opacity:.6; cursor:not-allowed; }
+.btn.primary{ background:var(--accent); border-color:#205fd1; }
+.btn.danger{ background:var(--danger); border-color:#cc3040; }
+.link{ margin-left:8px; background:transparent; border:none; color:#ffb84d; cursor:pointer; }
+
+.hint{ color:var(--muted); margin:6px 0 14px; }
+.inroom{ display:flex; align-items:center; gap:10px; }
+
+.callbar{ justify-content:flex-end; }
+.chk{ display:flex; align-items:center; gap:8px; margin-right:auto; color:#cfe1ff; }
+.chk input{ width:18px; height:18px; }
+
+.muted{ color:#b9cbe7; opacity:.8; }
+
+/* MEDIA LAYOUT
+   Remote video large; local as PiP in bottom-right */
+.media.single{ margin:12px 0 6px; }
+.remotePane{
+  position:relative;
+  background:#0a1322;
+  border:1px solid #213a60;
+  border-radius:14px;
+  padding:8px;
+  min-height:220px;
+}
+.remotePane > video{
+  width:100%;
+  height:420px;
+  max-height:60vh;
+  background:#000;
+  border-radius:10px;
+  object-fit:cover;
+}
+.remotePane > video.pip{
+  position:absolute;
+  right:16px;
+  bottom:16px;
+  width:120px;
+  height:160px;
+  border:2px solid #2a4f85;
+  border-radius:10px;
+  background:#000;
+  object-fit:cover;
+}
+
+.msgs{
+  background:#0b1524;
+  border:1px solid #233a5e;
+  border-radius:14px;
+  padding:10px;
+  min-height:96px;
+  max-height:260px;
+  overflow:auto;
 }
 .bubble{
-  background: var(--bubble);
-  border:1px solid var(--border);
-  border-radius:12px; padding:8px 10px; margin:8px 0;
+  background:#11213a;
+  border:1px solid #233a5e;
+  padding:8px 10px;
+  border-radius:10px;
+  margin:6px 0;
 }
-.bubble.sys{
-  background: var(--sys);
-  color:#ffe7b3;
+.bubble.sys{ background:#1a2a46; color:#d6e6ff; }
+.meta{
+  font-size:12px;
+  color:#9db3cf;
+  display:flex;
+  gap:12px;
+  margin-bottom:2px;
 }
-.meta{ display:flex; gap:8px; align-items:center; margin-bottom:4px; color:var(--muted); font-size:12px; }
-.who{ color:#d7e6ff; font-weight:600; }
+.who{ color:#ffdd87; }
 .ts{ opacity:.8; }
 
-/* Send area */
-.send{ display:flex; gap:10px; align-items:flex-end; margin-top:10px; }
-.send textarea{
-  min-height: 90px;        /* <- not a single line any more */
-  resize: vertical;
-}
+.send{ display:flex; gap:10px; margin-top:10px; }
 
-/* Simple video region if present (will not break if not used) */
-.video-grid{
-  display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin:12px 0;
+/* Incoming call overlay */
+.incoming{
+  position:fixed;
+  inset:0;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  background: rgba(0,0,0,.25);
+  backdrop-filter: blur(3px);
 }
-.video-wrap{
-  position:relative; background:#000; border-radius:12px; overflow:hidden; border:1px solid var(--border);
-  aspect-ratio: 16/9;
+.incoming .box{
+  background:#0f1d33;
+  border:1px solid #2a446c;
+  border-radius:16px;
+  padding:18px;
+  width:min(92vw, 420px);
+  box-shadow: 0 10px 40px #0007;
 }
-video{ width:100%; height:100%; object-fit:cover; display:block; }
-
-/* Hints */
-.hint{ color: var(--muted); font-size: 12px; margin: 6px 2px 0; }
-
-/* Mobile tweaks */
-@media (max-width: 640px){
-  .shell{ padding:8px; margin:10px auto; }
-  .msgs{ height: 36vh; }
-  .video-grid{ grid-template-columns: 1fr; }
-  label{ width:auto; }
-}
-
-/* --- Hide duplicate info --- */
-.msgs .bubble.sys {
-  display: none; /* hides "Socket connected" system messages */
-}
-
-.row.meta {
-  display: none; /* hides the "Client connects to..." line */
-}
-
-/* --- Add soft yellow glow to chat container --- */
-.glass {
-  box-shadow: 0 0 25px rgba(255, 215, 0, 0.6); /* golden yellow glow */
-  border-radius: 12px;
-  padding: 15px;
-}
-
-/* Optional: brighten buttons for appeal */
-.btn.primary {
-  background: linear-gradient(135deg, #0055aa, #0077cc);
-  border: none;
-  color: white;
-  font-weight: bold;
-}
-
-.btn.primary:hover {
-  background: linear-gradient(135deg, #004080, #005fa3);
-}
-
-/* --- Hide duplicate info --- */
-.msgs .bubble.sys {
-  display: none; /* hides "Socket connected" system messages */
-}
-
-.row.meta {
-  display: none; /* hides the "Client connects to..." line */
-}
-
-/* --- Add soft yellow glow to chat container --- */
-.glass {
-  box-shadow: 0 0 25px rgba(255, 215, 0, 0.6); /* golden yellow glow */
-  border-radius: 12px;
-  padding: 15px;
-}
-
-/* Optional: brighten buttons for appeal */
-.btn.primary {
-  background: linear-gradient(135deg, #0055aa, #0077cc);
-  border: none;
-  color: white;
-  font-weight: bold;
-}
-
-.btn.primary:hover {
-  background: linear-gradient(135deg, #004080, #005fa3);
-}
+.incoming .title{ font-weight:600; margin-bottom:14px; }
+.incoming .buttons{ display:flex; gap:10px; justify-content:flex-end; }
