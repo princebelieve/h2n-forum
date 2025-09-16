@@ -5,11 +5,14 @@ import "./App.css";
 // Server URL from Netlify/ENV
 const SERVER_URL = (import.meta.env.VITE_API_URL || "").split(",")[0].trim();
 
-// STUN only (TURN is infra-side, optional)
+// STUN only
 const ICE = { iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }] };
 
 // Performance-friendly constraints
-const AUDIO_ONLY = { audio: { echoCancellation: true, noiseSuppression: true }, video: false };
+const AUDIO_ONLY = {
+  audio: { echoCancellation: true, noiseSuppression: true },
+  video: false,
+};
 const LOW_VIDEO = {
   audio: { echoCancellation: true, noiseSuppression: true },
   video: {
@@ -49,8 +52,7 @@ export default function App() {
   const [msgs, setMsgs] = useState([]);
   const [text, setText] = useState("");
   const msgsRef = useRef(null);
-  const lastSentRef = useRef(null); // for local-echo de-dupe
-  const dedupeMapRef = useRef(new Map()); // name|text => ts
+  const dedupeMapRef = useRef(new Map()); // name|text -> ts
 
   // calls
   const [voiceOnly, setVoiceOnly] = useState(false);
@@ -64,23 +66,24 @@ export default function App() {
   const [muted, setMuted] = useState(false);
   const [videoOff, setVideoOff] = useState(false);
 
-  // UI: swap main vs PiP; fit/cover toggle for main video
+  // UI: stable main/PiP + fit/fill for main
   const [mainVideo, setMainVideo] = useState("remote"); // "remote" | "local"
-  const [videoFitContain, setVideoFitContain] = useState(false);
-  const offerTimeoutRef = useRef(null);
+  const [videoFitContain, setVideoFitContain] = useState(true); // default to FIT (show whole face)
 
-  // helper: add message with cap
+  // no-answer protection
+  const offerTimeoutRef = useRef(null);
+  const offerBackupRef = useRef(null);
+
+  // helpers
   const addMsg = (m) =>
     setMsgs((p) => (p.length > 199 ? [...p.slice(-199), m] : [...p, m]));
-
   const seenRecently = (m) => {
     if (!m?.name || !m?.text) return false;
     const key = `${m.name}|${m.text}`;
     const now = Date.now();
     const t = dedupeMapRef.current.get(key);
-    if (t && now - t < 5000) return true; // 5s window
+    if (t && now - t < 5000) return true;
     dedupeMapRef.current.set(key, now);
-    // occasional cleanup
     if (dedupeMapRef.current.size > 200) {
       const cutoff = now - 60000;
       for (const [k, ts] of dedupeMapRef.current)
@@ -88,8 +91,20 @@ export default function App() {
     }
     return false;
   };
+  const stopRings = () => {
+    const a = ringInRef.current,
+      b = ringBackRef.current;
+    if (a) {
+      a.pause();
+      a.currentTime = 0;
+    }
+    if (b) {
+      b.pause();
+      b.currentTime = 0;
+    }
+  };
 
-  // --- Unlock audio on first gesture
+  // Unlock audio on first gesture
   useEffect(() => {
     const once = async () => {
       if (audioUnlocked) return;
@@ -112,20 +127,7 @@ export default function App() {
     return () => evts.forEach((e) => window.removeEventListener(e, once));
   }, [audioUnlocked]);
 
-  const stopRings = () => {
-    const a = ringInRef.current,
-      b = ringBackRef.current;
-    if (a) {
-      a.pause();
-      a.currentTime = 0;
-    }
-    if (b) {
-      b.pause();
-      b.currentTime = 0;
-    }
-  };
-
-  // --- Socket setup
+  // Socket setup
   useEffect(() => {
     const s = io(SERVER_URL, { transports: ["websocket"] });
     socketRef.current = s;
@@ -142,7 +144,7 @@ export default function App() {
       addMsg(m);
     });
 
-    // signaling
+    // signaling (1:1)
     s.on("rtc:offer", async ({ from, offer, kind = "video" }) => {
       setIncoming({ from, kind, sdp: offer });
       try {
@@ -154,6 +156,7 @@ export default function App() {
         await pcRef.current?.setRemoteDescription(answer);
       } finally {
         clearTimeout(offerTimeoutRef.current);
+        clearTimeout(offerBackupRef.current);
       }
     });
     s.on("rtc:ice", async ({ candidate }) => {
@@ -168,13 +171,13 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // persist & re-hello on name change
+  // persist name + re-hello
   useEffect(() => {
     localStorage.setItem("me", me);
     socketRef.current?.emit("hello", me);
   }, [me]);
 
-  // join via URL
+  // prefill join via URL
   useEffect(() => {
     const q = new URLSearchParams(location.search);
     const code = q.get("room");
@@ -191,7 +194,7 @@ export default function App() {
     });
   }, [msgs]);
 
-  // --- Rooms
+  // Rooms
   const createRoom = () => {
     socketRef.current?.emit("create-room", { name: roomName, pin }, (res) => {
       if (!res?.ok) return;
@@ -233,20 +236,18 @@ export default function App() {
     hangUp();
   };
 
-  // --- Chat
+  // Chat
   const sendChat = () => {
     const t = text.trim();
     if (!t) return;
-    const now = Date.now();
-    const mine = { name: me, ts: now, text: t };
-    seenRecently(mine); // record so server echo is ignored
-    addMsg(mine); // local echo
-    lastSentRef.current = { text: t, ts: now };
+    const mine = { name: me, ts: Date.now(), text: t };
+    seenRecently(mine); // so server echo is deduped
+    addMsg(mine);
     socketRef.current?.emit("chat", t);
     setText("");
   };
 
-  // --- WebRTC helpers
+  // WebRTC helpers (1:1)
   const setupPC = (kind) => {
     const pc = new RTCPeerConnection(ICE);
     pcRef.current = pc;
@@ -269,6 +270,7 @@ export default function App() {
         setNet("Connected");
         setStatus("");
         clearTimeout(offerTimeoutRef.current);
+        clearTimeout(offerBackupRef.current);
       } else if (s === "checking") {
         setNet("Connecting");
       } else if (s === "disconnected" || s === "failed") {
@@ -292,8 +294,8 @@ export default function App() {
     return pc;
   };
 
-  const getStream = async (kind, constraints) => {
-    const c = constraints || (kind === "audio" ? AUDIO_ONLY : LOW_VIDEO);
+  const getStream = async (kind) => {
+    const c = kind === "audio" ? AUDIO_ONLY : LOW_VIDEO;
     const ms = await navigator.mediaDevices.getUserMedia(c);
     if (localRef.current) localRef.current.srcObject = ms;
     return ms;
@@ -314,10 +316,11 @@ export default function App() {
     }
   };
 
-  // --- Call controls
+  // Call controls
   const toggleCall = async () => {
     if (!room?.code) return;
 
+    // end?
     if (calling || inCall) {
       hangUp();
       return;
@@ -349,20 +352,32 @@ export default function App() {
       socketRef.current?.emit("rtc:offer", { roomId: room.code, offer, kind });
       setNet("Connecting");
 
-      // auto hang-up if no answer within 25s
+      // Auto-hangup if no answer
       clearTimeout(offerTimeoutRef.current);
+      clearTimeout(offerBackupRef.current);
+
       offerTimeoutRef.current = setTimeout(() => {
+        if (!inCall && pcRef.current && pcRef.current.connectionState !== "connected") {
+          stopRings();
+          setStatus("No answer");
+          addMsg({ sys: true, ts: Date.now(), text: "Call ended: no answer" });
+          hangUp();
+        }
+      }, 20000);
+
+      // backup watchdog (page sleep, backgrounded tabs, etc.)
+      offerBackupRef.current = setTimeout(() => {
         if (!inCall) {
           stopRings();
           setStatus("No answer");
           addMsg({
             sys: true,
             ts: Date.now(),
-            text: "Call ended: no answer",
+            text: "Call ended: no answer (backup)",
           });
           hangUp();
         }
-      }, 25000);
+      }, 35000);
     } catch (e) {
       console.error(e);
       setCalling(false);
@@ -411,6 +426,7 @@ export default function App() {
     setVideoOff(false);
     setMainVideo("remote");
     clearTimeout(offerTimeoutRef.current);
+    clearTimeout(offerBackupRef.current);
 
     try {
       pcRef.current?.getSenders?.().forEach((s) => s.track && s.track.stop());
@@ -449,9 +465,6 @@ export default function App() {
     await navigator.clipboard.writeText(url.toString());
     setStatus("Invite link copied");
   };
-
-  const swapVideos = () => setMainVideo((m) => (m === "remote" ? "local" : "remote"));
-  const toggleVideoFit = () => setVideoFitContain((v) => !v);
 
   const callButtonLabel = calling || inCall ? "End Call" : "Start Call";
 
@@ -615,52 +628,32 @@ export default function App() {
               </div>
             )}
 
-            {/* media area */}
-            <div className="media single">
-              <div className="remotePane">
-                {/* MAIN */}
-                {mainVideo === "remote" ? (
+            {/* media area — always render both videos; swap via classes */}
+            {!voiceOnly && (
+              <div className="media single">
+                <div className="remotePane">
+                  {/* REMOTE (click to make main) */}
                   <video
                     ref={remoteRef}
                     autoPlay
                     playsInline
-                    className={videoFitContain ? "fit" : ""}
-                    onDoubleClick={toggleVideoFit}
-                    onClick={swapVideos}
+                    className={mainVideo === "remote" ? (videoFitContain ? "fit" : "") : "pip"}
+                    onClick={() => setMainVideo("remote")}
+                    onDoubleClick={() => setVideoFitContain((v) => !v)}
                   />
-                ) : (
+                  {/* LOCAL (click to make main) */}
                   <video
                     ref={localRef}
                     autoPlay
                     playsInline
                     muted
-                    className={videoFitContain ? "fit" : ""}
-                    onDoubleClick={toggleVideoFit}
-                    onClick={swapVideos}
+                    className={mainVideo === "local" ? (videoFitContain ? "fit" : "") : "pip"}
+                    onClick={() => setMainVideo("local")}
+                    onDoubleClick={() => setVideoFitContain((v) => !v)}
                   />
-                )}
-
-                {/* PiP */}
-                {mainVideo === "remote" ? (
-                  <video
-                    ref={localRef}
-                    autoPlay
-                    playsInline
-                    muted
-                    className="pip"
-                    onClick={swapVideos}
-                  />
-                ) : (
-                  <video
-                    ref={remoteRef}
-                    autoPlay
-                    playsInline
-                    className="pip"
-                    onClick={swapVideos}
-                  />
-                )}
+                </div>
               </div>
-            </div>
+            )}
           </>
         )}
 

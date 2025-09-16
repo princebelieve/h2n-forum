@@ -233,3 +233,16 @@ textarea{
   .remotePane > video.pip{ width: 36vw; height: auto; aspect-ratio: 16/10; }
   .pill{ font-size:11px; padding:5px 8px; }
 }
+
+
+
+/* ... keep all your existing CSS above ... */
+
+/* Fit mode for remote video (instead of object-fit: cover) */
+.remotePane > video.fit { object-fit: contain; }
+
+/* Make it clear the videos are interactive (swap / fit toggle) */
+.remotePane > video,
+
+.remotePane > video, .remotePane > video.pip { cursor: pointer; }
+
