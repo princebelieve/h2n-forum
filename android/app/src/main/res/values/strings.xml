@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">H2N Forum</string>
+    <string name="title_activity_main">H2N Forum</string>
+    <string name="package_name">com.h2n.forum</string>
+    <string name="custom_url_scheme">com.h2n.forum</string>
+</resources>
