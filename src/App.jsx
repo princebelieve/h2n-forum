@@ -5,14 +5,19 @@ import "./App.css";
 // Server URL from Netlify/ENV
 const SERVER_URL = (import.meta.env.VITE_API_URL || "").split(",")[0].trim();
 
-// STUN only (TURN would be infra-side)
+// STUN only (TURN is infra-side, optional)
 const ICE = { iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }] };
 
 // Performance-friendly constraints
 const AUDIO_ONLY = { audio: { echoCancellation: true, noiseSuppression: true }, video: false };
 const LOW_VIDEO = {
   audio: { echoCancellation: true, noiseSuppression: true },
-  video: { width: { ideal: 640, max: 640 }, height: { ideal: 360, max: 360 }, frameRate: { max: 15 }, facingMode: "user" }
+  video: {
+    width: { ideal: 640, max: 640 },
+    height: { ideal: 360, max: 360 },
+    frameRate: { max: 15 },
+    facingMode: "user",
+  },
 };
 
 export default function App() {
@@ -25,8 +30,8 @@ export default function App() {
   const remoteRef = useRef(null);
 
   // sounds
-  const ringInRef = useRef(null);    // /sounds/incoming.mp3
-  const ringBackRef = useRef(null);  // /sounds/ringback.mp3
+  const ringInRef = useRef(null); // /sounds/incoming.mp3
+  const ringBackRef = useRef(null); // /sounds/ringback.mp3
   const [audioUnlocked, setAudioUnlocked] = useState(false);
 
   // identity + connection
@@ -44,7 +49,8 @@ export default function App() {
   const [msgs, setMsgs] = useState([]);
   const [text, setText] = useState("");
   const msgsRef = useRef(null);
-  const lastSentRef = useRef(null); // dedupe local echo vs server echo
+  const lastSentRef = useRef(null); // for local-echo de-dupe
+  const dedupeMapRef = useRef(new Map()); // name|text => ts
 
   // calls
   const [voiceOnly, setVoiceOnly] = useState(false);
@@ -52,26 +58,51 @@ export default function App() {
   const [starting, setStarting] = useState(false);
   const [inCall, setInCall] = useState(false);
   const [incoming, setIncoming] = useState(null); // { from, kind, sdp }
-  const [status, setStatus] = useState("");       // short status line
-  const [net, setNet] = useState("Idle");         // Idle | Connecting | Connected | Reconnecting
+  const [status, setStatus] = useState("");
+  const [net, setNet] = useState("Idle"); // Idle | Connecting | Connected | Reconnecting
 
   const [muted, setMuted] = useState(false);
   const [videoOff, setVideoOff] = useState(false);
 
-  const addMsg = (m) => setMsgs((p) => [...p, m]);
+  // UI: swap main vs PiP; fit/cover toggle for main video
+  const [mainVideo, setMainVideo] = useState("remote"); // "remote" | "local"
+  const [videoFitContain, setVideoFitContain] = useState(false);
+  const offerTimeoutRef = useRef(null);
 
-  // --- Unlock audio on first user gesture (mobile autoplay rules)
+  // helper: add message with cap
+  const addMsg = (m) =>
+    setMsgs((p) => (p.length > 199 ? [...p.slice(-199), m] : [...p, m]));
+
+  const seenRecently = (m) => {
+    if (!m?.name || !m?.text) return false;
+    const key = `${m.name}|${m.text}`;
+    const now = Date.now();
+    const t = dedupeMapRef.current.get(key);
+    if (t && now - t < 5000) return true; // 5s window
+    dedupeMapRef.current.set(key, now);
+    // occasional cleanup
+    if (dedupeMapRef.current.size > 200) {
+      const cutoff = now - 60000;
+      for (const [k, ts] of dedupeMapRef.current)
+        if (ts < cutoff) dedupeMapRef.current.delete(k);
+    }
+    return false;
+  };
+
+  // --- Unlock audio on first gesture
   useEffect(() => {
     const once = async () => {
       if (audioUnlocked) return;
       try {
         if (ringInRef.current) {
           await ringInRef.current.play().catch(() => {});
-          ringInRef.current.pause(); ringInRef.current.currentTime = 0;
+          ringInRef.current.pause();
+          ringInRef.current.currentTime = 0;
         }
         if (ringBackRef.current) {
           await ringBackRef.current.play().catch(() => {});
-          ringBackRef.current.pause(); ringBackRef.current.currentTime = 0;
+          ringBackRef.current.pause();
+          ringBackRef.current.currentTime = 0;
         }
         setAudioUnlocked(true);
       } catch {}
@@ -82,9 +113,16 @@ export default function App() {
   }, [audioUnlocked]);
 
   const stopRings = () => {
-    const a = ringInRef.current, b = ringBackRef.current;
-    if (a) { a.pause(); a.currentTime = 0; }
-    if (b) { b.pause(); b.currentTime = 0; }
+    const a = ringInRef.current,
+      b = ringBackRef.current;
+    if (a) {
+      a.pause();
+      a.currentTime = 0;
+    }
+    if (b) {
+      b.pause();
+      b.currentTime = 0;
+    }
   };
 
   // --- Socket setup
@@ -92,29 +130,38 @@ export default function App() {
     const s = io(SERVER_URL, { transports: ["websocket"] });
     socketRef.current = s;
 
-    s.on("connect", () => { setConnected(true); s.emit("hello", me); });
+    s.on("connect", () => {
+      setConnected(true);
+      s.emit("hello", me);
+    });
     s.on("disconnect", () => setConnected(false));
 
     // chat
     s.on("chat", (m) => {
-      // simple dedupe if server echoes our message immediately
-      if (m?.name === me && lastSentRef.current && m.text === lastSentRef.current.text) {
-        const dt = typeof m.ts === "number" ? Math.abs(m.ts - lastSentRef.current.ts) : 0;
-        if (dt <= 2000) return;
-      }
+      if (seenRecently(m)) return;
       addMsg(m);
     });
 
     // signaling
     s.on("rtc:offer", async ({ from, offer, kind = "video" }) => {
       setIncoming({ from, kind, sdp: offer });
-      try { await ringInRef.current?.play(); } catch {}
+      try {
+        await ringInRef.current?.play();
+      } catch {}
     });
     s.on("rtc:answer", async ({ answer }) => {
-      try { await pcRef.current?.setRemoteDescription(answer); } catch {}
+      try {
+        await pcRef.current?.setRemoteDescription(answer);
+      } finally {
+        clearTimeout(offerTimeoutRef.current);
+      }
     });
     s.on("rtc:ice", async ({ candidate }) => {
-      if (candidate) { try { await pcRef.current?.addIceCandidate(candidate); } catch {} }
+      if (candidate) {
+        try {
+          await pcRef.current?.addIceCandidate(candidate);
+        } catch {}
+      }
     });
 
     return () => s.disconnect();
@@ -127,17 +174,21 @@ export default function App() {
     socketRef.current?.emit("hello", me);
   }, [me]);
 
-  // fill join via URL params
+  // join via URL
   useEffect(() => {
     const q = new URLSearchParams(location.search);
-    const code = q.get("room"); const p = q.get("pin");
+    const code = q.get("room");
+    const p = q.get("pin");
     if (code) setJoinCode(code);
     if (p) setJoinPin(p);
   }, []);
 
   // auto-scroll messages
   useEffect(() => {
-    msgsRef.current?.scrollTo({ top: msgsRef.current.scrollHeight, behavior: "smooth" });
+    msgsRef.current?.scrollTo({
+      top: msgsRef.current.scrollHeight,
+      behavior: "smooth",
+    });
   }, [msgs]);
 
   // --- Rooms
@@ -146,18 +197,34 @@ export default function App() {
       if (!res?.ok) return;
       setRoom(res.room);
       setJoinCode(res.room.code);
-      addMsg({ sys: true, ts: Date.now(), text: `Created room: ${res.room.name} (${res.room.code})` });
+      addMsg({
+        sys: true,
+        ts: Date.now(),
+        text: `Created room: ${res.room.name} (${res.room.code})`,
+      });
     });
   };
   const joinRoom = () => {
-    socketRef.current?.emit("join-room", { code: joinCode.trim(), pin: joinPin.trim() }, (res) => {
-      if (!res?.ok) {
-        addMsg({ sys: true, ts: Date.now(), text: `Join failed: ${res?.error || "unknown error"}` });
-        return;
+    socketRef.current?.emit(
+      "join-room",
+      { code: joinCode.trim(), pin: joinPin.trim() },
+      (res) => {
+        if (!res?.ok) {
+          addMsg({
+            sys: true,
+            ts: Date.now(),
+            text: `Join failed: ${res?.error || "unknown error"}`,
+          });
+          return;
+        }
+        setRoom(res.room);
+        addMsg({
+          sys: true,
+          ts: Date.now(),
+          text: `Joined room: ${res.room.name} (${res.room.code})`,
+        });
       }
-      setRoom(res.room);
-      addMsg({ sys: true, ts: Date.now(), text: `Joined room: ${res.room.name} (${res.room.code})` });
-    });
+    );
   };
   const leaveRoom = () => {
     socketRef.current?.emit("leave-room");
@@ -171,9 +238,9 @@ export default function App() {
     const t = text.trim();
     if (!t) return;
     const now = Date.now();
-    // local echo
     const mine = { name: me, ts: now, text: t };
-    addMsg(mine);
+    seenRecently(mine); // record so server echo is ignored
+    addMsg(mine); // local echo
     lastSentRef.current = { text: t, ts: now };
     socketRef.current?.emit("chat", t);
     setText("");
@@ -186,15 +253,22 @@ export default function App() {
 
     pc.onicecandidate = (e) => {
       if (e.candidate) {
-        socketRef.current?.emit("rtc:ice", { roomId: room?.code, candidate: e.candidate });
+        socketRef.current?.emit("rtc:ice", {
+          roomId: room?.code,
+          candidate: e.candidate,
+        });
       }
     };
     pc.oniceconnectionstatechange = () => {
       const s = pc.iceConnectionState;
       if (s === "connected" || s === "completed") {
         stopRings();
-        setInCall(true); setCalling(false); setStarting(false);
-        setNet("Connected"); setStatus("");
+        setInCall(true);
+        setCalling(false);
+        setStarting(false);
+        setNet("Connected");
+        setStatus("");
+        clearTimeout(offerTimeoutRef.current);
       } else if (s === "checking") {
         setNet("Connecting");
       } else if (s === "disconnected" || s === "failed") {
@@ -228,8 +302,10 @@ export default function App() {
   const preflight = async (kind) => {
     try {
       setStatus("Requesting mic/camera…");
-      const test = await navigator.mediaDevices.getUserMedia(kind === "audio" ? AUDIO_ONLY : LOW_VIDEO);
-      test.getTracks().forEach(t => t.stop());
+      const test = await navigator.mediaDevices.getUserMedia(
+        kind === "audio" ? AUDIO_ONLY : LOW_VIDEO
+      );
+      test.getTracks().forEach((t) => t.stop());
       return true;
     } catch (e) {
       console.error(e);
@@ -242,29 +318,56 @@ export default function App() {
   const toggleCall = async () => {
     if (!room?.code) return;
 
-    if (calling || inCall) { hangUp(); return; }
+    if (calling || inCall) {
+      hangUp();
+      return;
+    }
 
     const kind = voiceOnly ? "audio" : "video";
-    setCalling(true); setStarting(true);
+    setCalling(true);
+    setStarting(true);
 
     try {
       const ok = await preflight(kind);
-      if (!ok) { setCalling(false); setStarting(false); return; }
+      if (!ok) {
+        setCalling(false);
+        setStarting(false);
+        return;
+      }
 
       const pc = setupPC(kind);
       const ms = await getStream(kind);
       ms.getTracks().forEach((t) => pc.addTrack(t, ms));
 
-      try { await ringBackRef.current?.play(); } catch {}
+      try {
+        await ringBackRef.current?.play();
+      } catch {}
       setStatus("Creating offer…");
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       socketRef.current?.emit("rtc:offer", { roomId: room.code, offer, kind });
       setNet("Connecting");
+
+      // auto hang-up if no answer within 25s
+      clearTimeout(offerTimeoutRef.current);
+      offerTimeoutRef.current = setTimeout(() => {
+        if (!inCall) {
+          stopRings();
+          setStatus("No answer");
+          addMsg({
+            sys: true,
+            ts: Date.now(),
+            text: "Call ended: no answer",
+          });
+          hangUp();
+        }
+      }, 25000);
     } catch (e) {
       console.error(e);
-      setCalling(false); setStarting(false); setStatus("");
+      setCalling(false);
+      setStarting(false);
+      setStatus("");
       stopRings();
     }
   };
@@ -299,15 +402,29 @@ export default function App() {
 
   const hangUp = () => {
     stopRings();
-    setCalling(false); setStarting(false); setInCall(false);
-    setStatus(""); setNet("Idle"); setMuted(false); setVideoOff(false);
+    setCalling(false);
+    setStarting(false);
+    setInCall(false);
+    setStatus("");
+    setNet("Idle");
+    setMuted(false);
+    setVideoOff(false);
+    setMainVideo("remote");
+    clearTimeout(offerTimeoutRef.current);
 
-    try { pcRef.current?.getSenders?.().forEach(s => s.track && s.track.stop()); } catch {}
-    try { pcRef.current?.close(); } catch {}
+    try {
+      pcRef.current?.getSenders?.().forEach((s) => s.track && s.track.stop());
+    } catch {}
+    try {
+      pcRef.current?.close();
+    } catch {}
     pcRef.current = null;
 
     const s = localRef.current?.srcObject;
-    if (s) { s.getTracks().forEach(t => t.stop()); localRef.current.srcObject = null; }
+    if (s) {
+      s.getTracks().forEach((t) => t.stop());
+      localRef.current.srcObject = null;
+    }
     if (remoteRef.current?.srcObject) remoteRef.current.srcObject = null;
 
     socketRef.current?.emit("rtc:leave", { roomId: room?.code });
@@ -315,25 +432,28 @@ export default function App() {
 
   const toggleMute = () => {
     const tracks = localRef.current?.srcObject?.getAudioTracks?.() || [];
-    tracks.forEach(t => t.enabled = !t.enabled);
-    setMuted(v => !v);
+    tracks.forEach((t) => (t.enabled = !t.enabled));
+    setMuted((v) => !v);
   };
   const toggleVideo = () => {
     const tracks = localRef.current?.srcObject?.getVideoTracks?.() || [];
-    tracks.forEach(t => t.enabled = !t.enabled);
-    setVideoOff(v => !v);
+    tracks.forEach((t) => (t.enabled = !t.enabled));
+    setVideoOff((v) => !v);
   };
 
   const copyInvite = async () => {
     if (!room?.code) return;
     const url = new URL(location.href);
     url.searchParams.set("room", room.code);
-    if (room.requiresPin) url.searchParams.set("pin", pin || "");
+    if (room?.requiresPin) url.searchParams.set("pin", pin || "");
     await navigator.clipboard.writeText(url.toString());
     setStatus("Invite link copied");
   };
 
-  const callButtonLabel = (calling || inCall) ? "End Call" : "Start Call";
+  const swapVideos = () => setMainVideo((m) => (m === "remote" ? "local" : "remote"));
+  const toggleVideoFit = () => setVideoFitContain((v) => !v);
+
+  const callButtonLabel = calling || inCall ? "End Call" : "Start Call";
 
   return (
     <div className="shell">
@@ -349,26 +469,43 @@ export default function App() {
           </span>
 
           {/* Compact identity chip with inline editor */}
-          <button className="chip" onClick={() => { setShowNameEdit(v => !v); setNameDraft(me); }}>
-            <span className="chip-label">You:</span> <b className="chip-name">{me}</b> <span className="chip-edit">✎</span>
+          <button
+            className="chip"
+            onClick={() => {
+              setShowNameEdit((v) => !v);
+              setNameDraft(me);
+            }}
+          >
+            <span className="chip-label">You:</span>{" "}
+            <b className="chip-name">{me}</b>{" "}
+            <span className="chip-edit">✎</span>
           </button>
 
           {showNameEdit && (
             <div className="name-pop">
               <div className="name-row">
-                <input value={nameDraft} onChange={(e)=>setNameDraft(e.target.value)} />
+                <input
+                  value={nameDraft}
+                  onChange={(e) => setNameDraft(e.target.value)}
+                />
               </div>
               <div className="name-actions">
-                <button className="btn" onClick={()=>setShowNameEdit(false)}>Cancel</button>
-                <button className="btn primary" onClick={()=>{ setMe(nameDraft.trim() || "Me"); setShowNameEdit(false); }}>
+                <button className="btn" onClick={() => setShowNameEdit(false)}>
+                  Cancel
+                </button>
+                <button
+                  className="btn primary"
+                  onClick={() => {
+                    setMe(nameDraft.trim() || "Me");
+                    setShowNameEdit(false);
+                  }}
+                >
                   Save
                 </button>
               </div>
             </div>
           )}
         </header>
-
-        {/* de-complexed top section: no big "Your name" row */}
 
         {!room && (
           <>
@@ -384,7 +521,9 @@ export default function App() {
                 value={pin}
                 onChange={(e) => setPin(e.target.value)}
               />
-              <button className="btn primary" onClick={createRoom}>Create Meeting</button>
+              <button className="btn primary" onClick={createRoom}>
+                Create Meeting
+              </button>
             </div>
 
             <div className="row title right">Code + optional PIN</div>
@@ -399,11 +538,14 @@ export default function App() {
                 value={joinPin}
                 onChange={(e) => setJoinPin(e.target.value)}
               />
-              <button className="btn" onClick={joinRoom}>Join</button>
+              <button className="btn" onClick={joinRoom}>
+                Join
+              </button>
             </div>
 
             <div className="hint">
-              Rooms auto-delete after being empty for a while. Share the code (and PIN if set).
+              Rooms auto-delete after being empty for a while. Share the code
+              (and PIN if set).
             </div>
           </>
         )}
@@ -412,9 +554,14 @@ export default function App() {
           <>
             <div className="row">
               <div className="inroom">
-                In room: <b>{room.name}</b> <span className="mono">({room.code})</span>
-                <button className="link" onClick={copyInvite}>Copy invite</button>
-                <button className="link" onClick={leaveRoom}>Leave</button>
+                In room: <b>{room.name}</b>{" "}
+                <span className="mono">({room.code})</span>
+                <button className="link" onClick={copyInvite}>
+                  Copy invite
+                </button>
+                <button className="link" onClick={leaveRoom}>
+                  Leave
+                </button>
               </div>
             </div>
 
@@ -439,13 +586,17 @@ export default function App() {
               <button className="btn" onClick={toggleMute} disabled={!inCall}>
                 {muted ? "Unmute" : "Mute"}
               </button>
-              <button className="btn" onClick={toggleVideo} disabled={!inCall || voiceOnly}>
+              <button
+                className="btn"
+                onClick={toggleVideo}
+                disabled={!inCall || voiceOnly}
+              >
                 {videoOff ? "Camera On" : "Camera Off"}
               </button>
             </div>
             {status && <div className="hint">{status}</div>}
 
-            {/* incoming call dialog — SINGLE correct block */}
+            {/* incoming call dialog */}
             {incoming && (
               <div className="incoming">
                 <div className="box">
@@ -453,18 +604,61 @@ export default function App() {
                     Incoming {incoming.kind === "audio" ? "voice" : "video"} call
                   </div>
                   <div className="buttons">
-                    <button className="btn primary" onClick={acceptIncoming}>Accept</button>
-                    <button className="btn danger" onClick={declineIncoming}>Decline</button>
+                    <button className="btn primary" onClick={acceptIncoming}>
+                      Accept
+                    </button>
+                    <button className="btn danger" onClick={declineIncoming}>
+                      Decline
+                    </button>
                   </div>
                 </div>
               </div>
             )}
 
-            {/* media: remote large, local small PiP */}
+            {/* media area */}
             <div className="media single">
               <div className="remotePane">
-                <video ref={remoteRef} autoPlay playsInline />
-                <video ref={localRef} autoPlay playsInline muted className="pip" />
+                {/* MAIN */}
+                {mainVideo === "remote" ? (
+                  <video
+                    ref={remoteRef}
+                    autoPlay
+                    playsInline
+                    className={videoFitContain ? "fit" : ""}
+                    onDoubleClick={toggleVideoFit}
+                    onClick={swapVideos}
+                  />
+                ) : (
+                  <video
+                    ref={localRef}
+                    autoPlay
+                    playsInline
+                    muted
+                    className={videoFitContain ? "fit" : ""}
+                    onDoubleClick={toggleVideoFit}
+                    onClick={swapVideos}
+                  />
+                )}
+
+                {/* PiP */}
+                {mainVideo === "remote" ? (
+                  <video
+                    ref={localRef}
+                    autoPlay
+                    playsInline
+                    muted
+                    className="pip"
+                    onClick={swapVideos}
+                  />
+                ) : (
+                  <video
+                    ref={remoteRef}
+                    autoPlay
+                    playsInline
+                    className="pip"
+                    onClick={swapVideos}
+                  />
+                )}
               </div>
             </div>
           </>
@@ -480,7 +674,11 @@ export default function App() {
                 {!m.sys && (
                   <div className="meta">
                     <span className="who">{m.name}</span>
-                    <span className="ts">{typeof m.ts === "number" ? new Date(m.ts).toLocaleTimeString() : ""}</span>
+                    <span className="ts">
+                      {typeof m.ts === "number"
+                        ? new Date(m.ts).toLocaleTimeString()
+                        : ""}
+                    </span>
                   </div>
                 )}
                 <div className="text">{m.text}</div>
@@ -501,7 +699,9 @@ export default function App() {
               }
             }}
           />
-          <button className="btn primary" onClick={sendChat}>Send</button>
+          <button className="btn primary" onClick={sendChat}>
+            Send
+          </button>
         </div>
       </div>
     </div>
