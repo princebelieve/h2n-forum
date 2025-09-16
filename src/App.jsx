@@ -5,10 +5,18 @@ import "./App.css";
 // Server URL from Netlify/ENV
 const SERVER_URL = (import.meta.env.VITE_API_URL || "").split(",")[0].trim();
 
-// Public Google STUN. (No Twilio URL — the one with ?transport=udp was invalid.)
+// STUN only (TURN would be infra-side)
 const ICE = { iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }] };
 
+// Performance-friendly constraints
+const AUDIO_ONLY = { audio: { echoCancellation: true, noiseSuppression: true }, video: false };
+const LOW_VIDEO = {
+  audio: { echoCancellation: true, noiseSuppression: true },
+  video: { width: { ideal: 640, max: 640 }, height: { ideal: 360, max: 360 }, frameRate: { max: 15 }, facingMode: "user" }
+};
+
 export default function App() {
+  // sockets / rtc
   const socketRef = useRef(null);
   const pcRef = useRef(null);
 
@@ -21,9 +29,11 @@ export default function App() {
   const ringBackRef = useRef(null);  // /sounds/ringback.mp3
   const [audioUnlocked, setAudioUnlocked] = useState(false);
 
-  // connection / identity
+  // identity + connection
   const [connected, setConnected] = useState(false);
-  const [me, setMe] = useState("Me");
+  const [me, setMe] = useState(() => localStorage.getItem("me") || "Me");
+  const [showNameEdit, setShowNameEdit] = useState(false);
+  const [nameDraft, setNameDraft] = useState(me);
 
   // rooms + chat
   const [room, setRoom] = useState(null); // {code,name,requiresPin}
@@ -33,30 +43,35 @@ export default function App() {
   const [joinPin, setJoinPin] = useState("");
   const [msgs, setMsgs] = useState([]);
   const [text, setText] = useState("");
+  const msgsRef = useRef(null);
+  const lastSentRef = useRef(null); // dedupe local echo vs server echo
 
   // calls
   const [voiceOnly, setVoiceOnly] = useState(false);
   const [calling, setCalling] = useState(false);
+  const [starting, setStarting] = useState(false);
   const [inCall, setInCall] = useState(false);
   const [incoming, setIncoming] = useState(null); // { from, kind, sdp }
+  const [status, setStatus] = useState("");       // short status line
+  const [net, setNet] = useState("Idle");         // Idle | Connecting | Connected | Reconnecting
+
+  const [muted, setMuted] = useState(false);
+  const [videoOff, setVideoOff] = useState(false);
 
   const addMsg = (m) => setMsgs((p) => [...p, m]);
 
-  // --- Unlock audio on first user gesture (mobile browsers require this)
+  // --- Unlock audio on first user gesture (mobile autoplay rules)
   useEffect(() => {
     const once = async () => {
       if (audioUnlocked) return;
       try {
-        // prime both audio tags so future play() is allowed
         if (ringInRef.current) {
           await ringInRef.current.play().catch(() => {});
-          ringInRef.current.pause();
-          ringInRef.current.currentTime = 0;
+          ringInRef.current.pause(); ringInRef.current.currentTime = 0;
         }
         if (ringBackRef.current) {
           await ringBackRef.current.play().catch(() => {});
-          ringBackRef.current.pause();
-          ringBackRef.current.currentTime = 0;
+          ringBackRef.current.pause(); ringBackRef.current.currentTime = 0;
         }
         setAudioUnlocked(true);
       } catch {}
@@ -67,8 +82,7 @@ export default function App() {
   }, [audioUnlocked]);
 
   const stopRings = () => {
-    const a = ringInRef.current;
-    const b = ringBackRef.current;
+    const a = ringInRef.current, b = ringBackRef.current;
     if (a) { a.pause(); a.currentTime = 0; }
     if (b) { b.pause(); b.currentTime = 0; }
   };
@@ -80,30 +94,51 @@ export default function App() {
 
     s.on("connect", () => { setConnected(true); s.emit("hello", me); });
     s.on("disconnect", () => setConnected(false));
-    s.on("chat", (m) => addMsg(m));
 
-    // Signaling
+    // chat
+    s.on("chat", (m) => {
+      // simple dedupe if server echoes our message immediately
+      if (m?.name === me && lastSentRef.current && m.text === lastSentRef.current.text) {
+        const dt = typeof m.ts === "number" ? Math.abs(m.ts - lastSentRef.current.ts) : 0;
+        if (dt <= 2000) return;
+      }
+      addMsg(m);
+    });
+
+    // signaling
     s.on("rtc:offer", async ({ from, offer, kind = "video" }) => {
       setIncoming({ from, kind, sdp: offer });
-      // Try to ring for incoming call (works after audio unlocked by any tap)
       try { await ringInRef.current?.play(); } catch {}
     });
     s.on("rtc:answer", async ({ answer }) => {
-      await pcRef.current?.setRemoteDescription(answer);
+      try { await pcRef.current?.setRemoteDescription(answer); } catch {}
     });
     s.on("rtc:ice", async ({ candidate }) => {
-      if (candidate) {
-        try { await pcRef.current?.addIceCandidate(candidate); } catch {}
-      }
+      if (candidate) { try { await pcRef.current?.addIceCandidate(candidate); } catch {} }
     });
 
     return () => s.disconnect();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // persist & re-hello on name change
   useEffect(() => {
+    localStorage.setItem("me", me);
     socketRef.current?.emit("hello", me);
   }, [me]);
+
+  // fill join via URL params
+  useEffect(() => {
+    const q = new URLSearchParams(location.search);
+    const code = q.get("room"); const p = q.get("pin");
+    if (code) setJoinCode(code);
+    if (p) setJoinPin(p);
+  }, []);
+
+  // auto-scroll messages
+  useEffect(() => {
+    msgsRef.current?.scrollTo({ top: msgsRef.current.scrollHeight, behavior: "smooth" });
+  }, [msgs]);
 
   // --- Rooms
   const createRoom = () => {
@@ -115,18 +150,14 @@ export default function App() {
     });
   };
   const joinRoom = () => {
-    socketRef.current?.emit(
-      "join-room",
-      { code: joinCode.trim(), pin: joinPin.trim() },
-      (res) => {
-        if (!res?.ok) {
-          addMsg({ sys: true, ts: Date.now(), text: `Join failed: ${res?.error || "unknown error"}` });
-          return;
-        }
-        setRoom(res.room);
-        addMsg({ sys: true, ts: Date.now(), text: `Joined room: ${res.room.name} (${res.room.code})` });
+    socketRef.current?.emit("join-room", { code: joinCode.trim(), pin: joinPin.trim() }, (res) => {
+      if (!res?.ok) {
+        addMsg({ sys: true, ts: Date.now(), text: `Join failed: ${res?.error || "unknown error"}` });
+        return;
       }
-    );
+      setRoom(res.room);
+      addMsg({ sys: true, ts: Date.now(), text: `Joined room: ${res.room.name} (${res.room.code})` });
+    });
   };
   const leaveRoom = () => {
     socketRef.current?.emit("leave-room");
@@ -139,6 +170,11 @@ export default function App() {
   const sendChat = () => {
     const t = text.trim();
     if (!t) return;
+    const now = Date.now();
+    // local echo
+    const mine = { name: me, ts: now, text: t };
+    addMsg(mine);
+    lastSentRef.current = { text: t, ts: now };
     socketRef.current?.emit("chat", t);
     setText("");
   };
@@ -153,12 +189,21 @@ export default function App() {
         socketRef.current?.emit("rtc:ice", { roomId: room?.code, candidate: e.candidate });
       }
     };
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === "connected") {
+    pc.oniceconnectionstatechange = () => {
+      const s = pc.iceConnectionState;
+      if (s === "connected" || s === "completed") {
         stopRings();
-        setInCall(true);
-        setCalling(false);
+        setInCall(true); setCalling(false); setStarting(false);
+        setNet("Connected"); setStatus("");
+      } else if (s === "checking") {
+        setNet("Connecting");
+      } else if (s === "disconnected" || s === "failed") {
+        setNet("Reconnecting");
+      } else {
+        setNet("Idle");
       }
+    };
+    pc.onconnectionstatechange = () => {
       if (["disconnected", "failed", "closed"].includes(pc.connectionState)) {
         hangUp();
       }
@@ -173,39 +218,53 @@ export default function App() {
     return pc;
   };
 
-  const getStream = async (kind) => {
-    const constraints = kind === "audio"
-      ? { audio: true, video: false }
-      : { audio: true, video: { facingMode: "user" } };
-    const ms = await navigator.mediaDevices.getUserMedia(constraints);
+  const getStream = async (kind, constraints) => {
+    const c = constraints || (kind === "audio" ? AUDIO_ONLY : LOW_VIDEO);
+    const ms = await navigator.mediaDevices.getUserMedia(c);
     if (localRef.current) localRef.current.srcObject = ms;
     return ms;
   };
 
-  // --- Start (or end) call via single toggle button
+  const preflight = async (kind) => {
+    try {
+      setStatus("Requesting mic/camera…");
+      const test = await navigator.mediaDevices.getUserMedia(kind === "audio" ? AUDIO_ONLY : LOW_VIDEO);
+      test.getTracks().forEach(t => t.stop());
+      return true;
+    } catch (e) {
+      console.error(e);
+      setStatus("Permission denied or device not available");
+      return false;
+    }
+  };
+
+  // --- Call controls
   const toggleCall = async () => {
     if (!room?.code) return;
-    if (calling || inCall) {
-      hangUp();
-      return;
-    }
-    // start call
+
+    if (calling || inCall) { hangUp(); return; }
+
     const kind = voiceOnly ? "audio" : "video";
-    setCalling(true);
+    setCalling(true); setStarting(true);
+
     try {
+      const ok = await preflight(kind);
+      if (!ok) { setCalling(false); setStarting(false); return; }
+
       const pc = setupPC(kind);
       const ms = await getStream(kind);
       ms.getTracks().forEach((t) => pc.addTrack(t, ms));
 
-      // ringback starts inside user gesture -> should play on mobile
       try { await ringBackRef.current?.play(); } catch {}
+      setStatus("Creating offer…");
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       socketRef.current?.emit("rtc:offer", { roomId: room.code, offer, kind });
+      setNet("Connecting");
     } catch (e) {
       console.error(e);
-      setCalling(false);
+      setCalling(false); setStarting(false); setStatus("");
       stopRings();
     }
   };
@@ -216,6 +275,7 @@ export default function App() {
     stopRings();
     setIncoming(null);
     try {
+      setStatus("Answering…");
       const pc = setupPC(inc.kind || "video");
       const ms = await getStream(inc.kind || "video");
       ms.getTracks().forEach((t) => pc.addTrack(t, ms));
@@ -224,6 +284,8 @@ export default function App() {
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       socketRef.current?.emit("rtc:answer", { roomId: room?.code, answer });
+      setNet("Connecting");
+      setStatus("Connecting…");
     } catch (e) {
       console.error(e);
       hangUp();
@@ -237,22 +299,38 @@ export default function App() {
 
   const hangUp = () => {
     stopRings();
-    setCalling(false);
-    setInCall(false);
+    setCalling(false); setStarting(false); setInCall(false);
+    setStatus(""); setNet("Idle"); setMuted(false); setVideoOff(false);
 
-    // stop local media
-    const v = localRef.current;
-    const s = v?.srcObject;
-    if (s) {
-      s.getTracks().forEach((t) => t.stop());
-      v.srcObject = null;
-    }
-    if (remoteRef.current?.srcObject) remoteRef.current.srcObject = null;
-
+    try { pcRef.current?.getSenders?.().forEach(s => s.track && s.track.stop()); } catch {}
     try { pcRef.current?.close(); } catch {}
     pcRef.current = null;
 
+    const s = localRef.current?.srcObject;
+    if (s) { s.getTracks().forEach(t => t.stop()); localRef.current.srcObject = null; }
+    if (remoteRef.current?.srcObject) remoteRef.current.srcObject = null;
+
     socketRef.current?.emit("rtc:leave", { roomId: room?.code });
+  };
+
+  const toggleMute = () => {
+    const tracks = localRef.current?.srcObject?.getAudioTracks?.() || [];
+    tracks.forEach(t => t.enabled = !t.enabled);
+    setMuted(v => !v);
+  };
+  const toggleVideo = () => {
+    const tracks = localRef.current?.srcObject?.getVideoTracks?.() || [];
+    tracks.forEach(t => t.enabled = !t.enabled);
+    setVideoOff(v => !v);
+  };
+
+  const copyInvite = async () => {
+    if (!room?.code) return;
+    const url = new URL(location.href);
+    url.searchParams.set("room", room.code);
+    if (room.requiresPin) url.searchParams.set("pin", pin || "");
+    await navigator.clipboard.writeText(url.toString());
+    setStatus("Invite link copied");
   };
 
   const callButtonLabel = (calling || inCall) ? "End Call" : "Start Call";
@@ -269,12 +347,28 @@ export default function App() {
           <span className={`pill ${connected ? "ok" : ""}`}>
             {connected ? "Connected to server" : "Disconnected"}
           </span>
+
+          {/* Compact identity chip with inline editor */}
+          <button className="chip" onClick={() => { setShowNameEdit(v => !v); setNameDraft(me); }}>
+            <span className="chip-label">You:</span> <b className="chip-name">{me}</b> <span className="chip-edit">✎</span>
+          </button>
+
+          {showNameEdit && (
+            <div className="name-pop">
+              <div className="name-row">
+                <input value={nameDraft} onChange={(e)=>setNameDraft(e.target.value)} />
+              </div>
+              <div className="name-actions">
+                <button className="btn" onClick={()=>setShowNameEdit(false)}>Cancel</button>
+                <button className="btn primary" onClick={()=>{ setMe(nameDraft.trim() || "Me"); setShowNameEdit(false); }}>
+                  Save
+                </button>
+              </div>
+            </div>
+          )}
         </header>
 
-        <div className="row">
-          <label>Your name</label>
-          <input value={me} onChange={(e) => setMe(e.target.value)} />
-        </div>
+        {/* de-complexed top section: no big "Your name" row */}
 
         {!room && (
           <>
@@ -319,11 +413,12 @@ export default function App() {
             <div className="row">
               <div className="inroom">
                 In room: <b>{room.name}</b> <span className="mono">({room.code})</span>
+                <button className="link" onClick={copyInvite}>Copy invite</button>
                 <button className="link" onClick={leaveRoom}>Leave</button>
               </div>
             </div>
 
-            {/* one toggle button + voice-only checkbox */}
+            {/* call controls */}
             <div className="row callbar">
               <label className="chk">
                 <input
@@ -337,16 +432,26 @@ export default function App() {
               <button
                 className={`btn ${calling || inCall ? "danger" : ""}`}
                 onClick={toggleCall}
+                disabled={!connected || starting}
               >
-                {callButtonLabel}
+                {starting ? "Starting…" : callButtonLabel}
+              </button>
+              <button className="btn" onClick={toggleMute} disabled={!inCall}>
+                {muted ? "Unmute" : "Mute"}
+              </button>
+              <button className="btn" onClick={toggleVideo} disabled={!inCall || voiceOnly}>
+                {videoOff ? "Camera On" : "Camera Off"}
               </button>
             </div>
+            {status && <div className="hint">{status}</div>}
 
-            {/* incoming call dialog */}
+            {/* incoming call dialog — SINGLE correct block */}
             {incoming && (
               <div className="incoming">
                 <div className="box">
-                  <div className="title">Incoming {incoming.kind === "audio" ? "voice" : "video"} call</div>
+                  <div className="title">
+                    Incoming {incoming.kind === "audio" ? "voice" : "video"} call
+                  </div>
                   <div className="buttons">
                     <button className="btn primary" onClick={acceptIncoming}>Accept</button>
                     <button className="btn danger" onClick={declineIncoming}>Decline</button>
@@ -366,7 +471,7 @@ export default function App() {
         )}
 
         {/* messages */}
-        <div className="msgs">
+        <div className="msgs" ref={msgsRef}>
           {msgs.length === 0 ? (
             <div className="muted">No messages yet. Say hi! 👋</div>
           ) : (
@@ -375,7 +480,7 @@ export default function App() {
                 {!m.sys && (
                   <div className="meta">
                     <span className="who">{m.name}</span>
-                    <span className="ts">{new Date(m.ts).toLocaleTimeString()}</span>
+                    <span className="ts">{typeof m.ts === "number" ? new Date(m.ts).toLocaleTimeString() : ""}</span>
                   </div>
                 )}
                 <div className="text">{m.text}</div>

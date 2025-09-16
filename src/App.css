@@ -33,10 +33,11 @@ body{
   border:1px solid #1e3457;
   border-radius:18px;
   padding:16px;
-  box-shadow: 0 18px 50px #0009;  /* subtle, no yellow ring */
+  box-shadow: 0 18px 50px #0009;
 }
 
 .head{
+  position: relative;
   display:flex;
   align-items:center;
   gap:12px;
@@ -56,6 +57,43 @@ body{
   font-size:12px;
 }
 .pill.ok{ background:#1b5138; color:#c9f5dd; }
+
+/* Compact identity chip (replaces bulky Your name row) */
+.chip{
+  margin-left:8px;
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  padding:6px 10px;
+  border-radius:999px;
+  background: var(--chip);
+  color:#d6e6ff;
+  border:1px solid #2a446c;
+  cursor:pointer;
+}
+.chip .chip-label{ opacity:.8; font-size:12px; }
+.chip .chip-name{ font-weight:600; }
+.chip .chip-edit{ opacity:.8; font-size:12px; }
+
+/* Inline name editor popover */
+.name-pop{
+  position:absolute;
+  top: 40px;
+  right: 0;
+  background:#0f1d33;
+  border:1px solid #2a446c;
+  border-radius:12px;
+  padding:12px;
+  width:min(92vw, 320px);
+  box-shadow:0 10px 40px #0007;
+  z-index: 5;
+}
+.name-pop .name-row{ display:flex; }
+.name-pop .name-row input{
+  background:#0b1a2b; border:1px solid #294872;
+  color:var(--text); border-radius:10px; padding:10px 12px; width:100%;
+}
+.name-pop .name-actions{ display:flex; gap:8px; justify-content:flex-end; margin-top:8px; }
 
 .row{
   display:flex;
@@ -119,7 +157,8 @@ textarea{
 }
 .remotePane > video{
   width:100%;
-  height:420px;
+  /* Instead of fixed px height, use aspect-ratio for better responsiveness */
+  aspect-ratio: 16 / 9;
   max-height:60vh;
   background:#000;
   border-radius:10px;
@@ -145,6 +184,7 @@ textarea{
   min-height:96px;
   max-height:260px;
   overflow:auto;
+  scroll-behavior:smooth;
 }
 .bubble{
   background:#11213a;
@@ -175,6 +215,7 @@ textarea{
   justify-content:center;
   background: rgba(0,0,0,.25);
   backdrop-filter: blur(3px);
+  z-index: 10;
 }
 .incoming .box{
   background:#0f1d33;
@@ -186,3 +227,9 @@ textarea{
 }
 .incoming .title{ font-weight:600; margin-bottom:14px; }
 .incoming .buttons{ display:flex; gap:10px; justify-content:flex-end; }
+
+/* Mobile adjustments */
+@media (max-width: 520px){
+  .remotePane > video.pip{ width: 36vw; height: auto; aspect-ratio: 16/10; }
+  .pill{ font-size:11px; padding:5px 8px; }
+}
