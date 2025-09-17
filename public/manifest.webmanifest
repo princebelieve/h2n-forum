@@ -1,13 +1,9 @@
 {
   "name": "H2N Forum",
-  "short_name": "H2N Forum",
-  "description": "Join or create rooms, chat, and call with family.",
+  "short_name": "H2N",
   "start_url": "/",
-  "scope": "/",
   "display": "standalone",
   "background_color": "#0c1624",
   "theme_color": "#0c1624",
-  "icons": [
-    { "src": "/icon-1024.png", "sizes": "1024x1024", "type": "image/png", "purpose": "any maskable" }
-  ]
+  "description": "Lightweight rooms for chat & calls."
 }
