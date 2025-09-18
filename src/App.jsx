@@ -1,17 +1,24 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import "./App.css";
 
-/* ---------- Config ---------- */
-const SERVER_URL = (import.meta.env.VITE_SERVER_URL || "").split(",")[0].trim();
+/* --------------------------
+   Config
+--------------------------- */
+// Accept either name (use whichever you already set)
+const SERVER_URL =
+  (import.meta.env.VITE_SERVER_URL ||
+    import.meta.env.VITE_API_URL ||
+    "").split(",")[0].trim();
+
 const ICE = { iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }] };
 
 const AUDIO_ONLY = {
-  audio: { echoCancellation: true, noiseSuppression: true },
+  audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
   video: false,
 };
 const LOW_VIDEO = {
-  audio: { echoCancellation: true, noiseSuppression: true },
+  audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
   video: {
     width: { ideal: 640, max: 640 },
     height: { ideal: 360, max: 360 },
@@ -20,99 +27,84 @@ const LOW_VIDEO = {
   },
 };
 
+/* --------------------------
+   App
+--------------------------- */
 export default function App() {
   /* sockets */
   const socketRef = useRef(null);
 
-  /* peer connections (mesh) */
-  const pcsRef = useRef(new Map());           // peerId -> RTCPeerConnection
-  const remoteStreamsRef = useRef(new Map()); // peerId -> MediaStream
-
-  /* media elements */
-  const localRef = useRef(null);
-  const mainRemoteRef = useRef(null);
-
-  /* sounds */
-  const ringInRef = useRef(null);
-  const ringBackRef = useRef(null);
-  const [audioUnlocked, setAudioUnlocked] = useState(false);
-
-  /* identity + connection */
-  const [connected, setConnected] = useState(false);
-  const [myId, setMyId] = useState("");
+  /* identity */
   const [me, setMe] = useState(() => localStorage.getItem("me") || "Me");
+  const [connected, setConnected] = useState(false);
   const [showNameEdit, setShowNameEdit] = useState(false);
   const [nameDraft, setNameDraft] = useState(me);
 
-  /* rooms + chat */
-  const [room, setRoom] = useState(null); // { code,name,requiresPin, ownerId, locked }
+  /* room/lobby */
+  const [room, setRoom] = useState(null); // { code, name, locked, hostId, requiresPin }
   const [roomName, setRoomName] = useState("");
   const [pin, setPin] = useState("");
   const [joinCode, setJoinCode] = useState("");
   const [joinPin, setJoinPin] = useState("");
+  const isHost = useMemo(
+    () => !!room && socketRef.current && room.hostId === socketRef.current.id,
+    [room, socketRef.current?.id]
+  );
+
+  /* chat */
   const [msgs, setMsgs] = useState([]);
   const msgsRef = useRef(null);
+  const addMsg = (m) =>
+    setMsgs((p) => (p.length > 199 ? [...p.slice(-199), m] : [...p, m]));
   const [text, setText] = useState("");
-  const dedupeMapRef = useRef(new Map()); // name|text -> ts
 
-  /* call state */
+  /* media + call */
+  const localVideoRef = useRef(null);
+  const ringInRef = useRef(null);
+  const ringBackRef = useRef(null);
+  const [audioUnlocked, setAudioUnlocked] = useState(false);
+
   const [voiceOnly, setVoiceOnly] = useState(false);
-  const [calling, setCalling] = useState(false);
   const [starting, setStarting] = useState(false);
   const [inCall, setInCall] = useState(false);
-  const [incoming, setIncoming] = useState(null); // { from, kind, sdp }
   const [status, setStatus] = useState("");
   const [net, setNet] = useState("Idle");
 
-  /* ui */
+  // Mesh state: one RTCPeerConnection per peerId
+  const pcsRef = useRef(new Map());               // peerId -> RTCPeerConnection
+  const remMediaRef = useRef(new Map());          // peerId -> MediaStream
+  const [peers, setPeers] = useState([]);         // [{peerId}]
   const [muted, setMuted] = useState(false);
   const [videoOff, setVideoOff] = useState(false);
-  const [mainVideo, setMainVideo] = useState("remote");
+
+  // UI: swap & fit
+  const [mainVideo, setMainVideo] = useState("remote"); // "remote" or "local"
   const [videoFitContain, setVideoFitContain] = useState(true);
 
-  /* peers list for UI */
-  const [peerIds, setPeerIds] = useState([]); // remote peer ids we know about
+  // helpers
+  const localStreamRef = useRef(null);
+  const offerWatchdog = useRef(null);
 
-  /* timers */
-  const offerTimeoutRef = useRef(null);
-  const offerBackupRef = useRef(null);
-
-  const isHost = !!room && myId && room.ownerId === myId;
-
-  /* ---------- helpers ---------- */
-  const addMsg = (m) =>
-    setMsgs((p) => (p.length > 199 ? [...p.slice(-199), m] : [...p, m]));
-
-  const seenRecently = (m) => {
-    if (!m?.name || !m?.text) return false;
-    const key = `${m.name}|${m.text}`;
-    const now = Date.now();
-    const t = dedupeMapRef.current.get(key);
-    if (t && now - t < 5000) return true;
-    dedupeMapRef.current.set(key, now);
-    if (dedupeMapRef.current.size > 200) {
-      const cutoff = now - 60000;
-      for (const [k, ts] of dedupeMapRef.current) if (ts < cutoff) dedupeMapRef.current.delete(k);
-    }
-    return false;
+  const updatePeersView = () => {
+    setPeers(Array.from(remMediaRef.current.keys()).map((peerId) => ({ peerId })));
   };
 
-  const stopRings = () => {
-    for (const a of [ringInRef.current, ringBackRef.current]) {
-      if (!a) continue;
-      try { a.pause(); a.currentTime = 0; } catch {}
-    }
-  };
-
-  /* ---------- unlock audio once ---------- */
+  /* --------------------------
+     Audio unlock (tones)
+  --------------------------- */
   useEffect(() => {
     const once = async () => {
       if (audioUnlocked) return;
       try {
-        for (const a of [ringInRef.current, ringBackRef.current]) {
-          if (!a) continue;
-          await a.play().catch(() => {});
-          a.pause(); a.currentTime = 0;
+        if (ringInRef.current) {
+          await ringInRef.current.play().catch(() => {});
+          ringInRef.current.pause();
+          ringInRef.current.currentTime = 0;
+        }
+        if (ringBackRef.current) {
+          await ringBackRef.current.play().catch(() => {});
+          ringBackRef.current.pause();
+          ringBackRef.current.currentTime = 0;
         }
         setAudioUnlocked(true);
       } catch {}
@@ -122,7 +114,9 @@ export default function App() {
     return () => evts.forEach((e) => window.removeEventListener(e, once));
   }, [audioUnlocked]);
 
-  /* ---------- sockets ---------- */
+  /* --------------------------
+     Socket setup
+  --------------------------- */
   useEffect(() => {
     const s = io(SERVER_URL, { transports: ["websocket"] });
     socketRef.current = s;
@@ -133,75 +127,64 @@ export default function App() {
     });
     s.on("disconnect", () => setConnected(false));
 
-    s.on("welcome", ({ id }) => setMyId(id));
+    // Chat
+    s.on("chat", (m) => addMsg(m));
 
-    // chat
-    s.on("chat", (m) => { if (!seenRecently(m)) addMsg(m); });
+    // Room updates from server (lock, host changes, etc.)
+    s.on("room:update", (r) => setRoom((prev) => ({ ...(prev || {}), ...r })));
 
-    // presence
+    // Mesh signaling hooks
     s.on("rtc:peer-joined", ({ peerId }) => {
-      setPeerIds((prev) => (prev.includes(peerId) ? prev : [...prev, peerId]));
+      // Someone else joined the call room; create outbound offer if we’re already inCall
+      if (inCall && room?.code) makeOfferTo(peerId);
     });
     s.on("rtc:peer-left", ({ peerId }) => {
-      cleanupPeer(peerId);
+      try {
+        pcsRef.current.get(peerId)?.close();
+      } catch {}
+      pcsRef.current.delete(peerId);
+      remMediaRef.current.delete(peerId);
+      updatePeersView();
+    });
+    s.on("rtc:offer", async ({ from, offer }) => {
+      // Prepare local if not already
+      await ensureLocal(voiceOnly ? "audio" : "video");
+      const pc = ensurePC(from);
+      await pc.setRemoteDescription(offer);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      s.emit("rtc:answer", { roomId: room?.code, answer });
+    });
+    s.on("rtc:answer", async ({ from, answer }) => {
+      try {
+        await pcsRef.current.get(from)?.setRemoteDescription(answer);
+      } catch {}
+    });
+    s.on("rtc:ice", async ({ from, candidate }) => {
+      try {
+        if (candidate) await pcsRef.current.get(from)?.addIceCandidate(candidate);
+      } catch {}
     });
 
-    // moderation
-    s.on("room:locked", ({ locked }) => {
-      setRoom((r) => (r ? { ...r, locked } : r));
-      addMsg({ sys: true, ts: Date.now(), text: locked ? "Host locked the room" : "Host unlocked the room" });
-    });
-    s.on("moderation:mute", () => {
-      // mute local mic
-      const tracks = localRef.current?.srcObject?.getAudioTracks?.() || [];
+    // Host actions
+    s.on("call:endall", () => leaveCall());
+    s.on("mute:all", () => {
+      const tracks = localStreamRef.current?.getAudioTracks?.() || [];
       tracks.forEach((t) => (t.enabled = false));
       setMuted(true);
-      addMsg({ sys: true, ts: Date.now(), text: "Host muted everyone" });
-    });
-    s.on("moderation:endcall", () => {
-      addMsg({ sys: true, ts: Date.now(), text: "Host ended the call" });
-      hangUp();
-    });
-    s.on("moderation:kicked", ({ reason }) => {
-      addMsg({ sys: true, ts: Date.now(), text: reason || "Removed by host" });
-      leaveRoom();
-    });
-
-    // signaling
-    s.on("rtc:offer", async ({ from, offer, kind = "video" }) => {
-      setIncoming({ from, kind, sdp: offer });
-      try { await ringInRef.current?.play(); } catch {}
-    });
-
-    s.on("rtc:answer", async ({ from, answer }) => {
-      const pc = pcsRef.current.get(from);
-      if (!pc) return;
-      try {
-        await pc.setRemoteDescription(answer);
-      } finally {
-        clearTimeout(offerTimeoutRef.current);
-        clearTimeout(offerBackupRef.current);
-      }
-    });
-
-    s.on("rtc:ice", async ({ from, candidate }) => {
-      const pc = pcsRef.current.get(from);
-      if (pc && candidate) {
-        try { await pc.addIceCandidate(candidate); } catch {}
-      }
     });
 
     return () => s.disconnect();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /* persist name */
+  // keep name persisted + tell server
   useEffect(() => {
     localStorage.setItem("me", me);
     socketRef.current?.emit("hello", me);
   }, [me]);
 
-  /* prefill join via URL */
+  // prefill join via URL (?room=&pin=)
   useEffect(() => {
     const q = new URLSearchParams(location.search);
     const code = q.get("room");
@@ -210,252 +193,211 @@ export default function App() {
     if (p) setJoinPin(p);
   }, []);
 
-  /* auto-scroll chat */
+  // autoscroll chat
   useEffect(() => {
-    msgsRef.current?.scrollTo({ top: msgsRef.current.scrollHeight, behavior: "smooth" });
+    msgsRef.current?.scrollTo({
+      top: msgsRef.current.scrollHeight,
+      behavior: "smooth",
+    });
   }, [msgs]);
 
-  /* ---------- room actions ---------- */
+  /* --------------------------
+     Room actions
+  --------------------------- */
   const createRoom = () => {
     socketRef.current?.emit("create-room", { name: roomName, pin }, (res) => {
-      if (!res?.ok) {
-        addMsg({ sys: true, ts: Date.now(), text: `Create failed: ${res?.error || "unknown"}` });
-        return;
-      }
-      setRoom(res.room);
+      if (!res?.ok) return addMsg({ sys: true, ts: Date.now(), text: "Create failed" });
+      setRoom(res.room); // room: { code,name,requiresPin,hostId,locked? }
       setJoinCode(res.room.code);
       addMsg({ sys: true, ts: Date.now(), text: `Created room: ${res.room.name} (${res.room.code})` });
     });
   };
 
   const joinRoom = () => {
-    socketRef.current?.emit(
-      "join-room",
-      { code: joinCode.trim(), pin: joinPin.trim() },
-      (res) => {
-        if (!res?.ok) {
-          addMsg({ sys: true, ts: Date.now(), text: `Join failed: ${res?.error || "unknown"}` });
-          return;
-        }
-        setRoom(res.room);
-        addMsg({ sys: true, ts: Date.now(), text: `Joined room: ${res.room.name} (${res.room.code})` });
+    socketRef.current?.emit("join-room", { code: joinCode.trim(), pin: joinPin.trim() }, (res) => {
+      if (!res?.ok) {
+        return addMsg({ sys: true, ts: Date.now(), text: `Join failed: ${res?.error || "unknown"}` });
       }
-    );
+      setRoom(res.room);
+      addMsg({ sys: true, ts: Date.now(), text: `Joined room: ${res.room.name} (${res.room.code})` });
+    });
   };
 
   const leaveRoom = () => {
     socketRef.current?.emit("leave-room");
     setRoom(null);
     addMsg({ sys: true, ts: Date.now(), text: "Left room" });
-    hangUp();
-    setPeerIds([]);
+    leaveCall();
   };
 
-  /* ---------- media / webrtc ---------- */
-  const getStream = async (kind) => {
-    const c = kind === "audio" ? AUDIO_ONLY : LOW_VIDEO;
-    const ms = await navigator.mediaDevices.getUserMedia(c);
-    if (localRef.current) localRef.current.srcObject = ms;
-    return ms;
+  /* --------------------------
+     Chat
+  --------------------------- */
+  const sendChat = () => {
+    const t = text.trim();
+    if (!t) return;
+    const mine = { name: me, ts: Date.now(), text: t };
+    addMsg(mine);
+    socketRef.current?.emit("chat", t);
+    setText("");
   };
 
-  const makePC = (peerId) => {
-    const pc = new RTCPeerConnection(ICE);
+  /* --------------------------
+     WebRTC helpers (mesh)
+  --------------------------- */
+  const ensurePC = (peerId) => {
+    let pc = pcsRef.current.get(peerId);
+    if (pc) return pc;
+
+    pc = new RTCPeerConnection(ICE);
+    pcsRef.current.set(peerId, pc);
 
     pc.onicecandidate = (e) => {
       if (e.candidate) {
         socketRef.current?.emit("rtc:ice", {
           roomId: room?.code,
-          to: peerId,
           candidate: e.candidate,
+          to: peerId,
         });
       }
     };
-
     pc.oniceconnectionstatechange = () => {
       const s = pc.iceConnectionState;
-      if (s === "connected" || s === "completed") {
-        stopRings();
-        setInCall(true);
-        setCalling(false);
-        setStarting(false);
-        setNet("Connected");
-        setStatus("");
-        clearTimeout(offerTimeoutRef.current);
-        clearTimeout(offerBackupRef.current);
-      } else if (s === "checking") {
-        setNet("Connecting");
-      } else if (s === "disconnected" || s === "failed") {
-        setNet("Reconnecting");
-      }
+      if (s === "connected" || s === "completed") setNet("Connected");
+      else if (s === "checking") setNet("Connecting");
+      else if (s === "failed" || s === "disconnected") setNet("Reconnecting");
     };
-
     pc.onconnectionstatechange = () => {
       if (["disconnected", "failed", "closed"].includes(pc.connectionState)) {
-        cleanupPeer(peerId);
+        // drop remote on hard fail
+        pcsRef.current.delete(peerId);
+        remMediaRef.current.delete(peerId);
+        updatePeersView();
       }
     };
-
     pc.ontrack = (ev) => {
       const ms = ev.streams?.[0];
       if (!ms) return;
-      remoteStreamsRef.current.set(peerId, ms);
-
-      if (mainRemoteRef.current && !mainRemoteRef.current.srcObject) {
-        mainRemoteRef.current.srcObject = ms;
-      }
-      setPeerIds((prev) => (prev.includes(peerId) ? [...prev] : [...prev, peerId]));
+      remMediaRef.current.set(peerId, ms);
+      updatePeersView();
     };
 
-    pcsRef.current.set(peerId, pc);
+    // Attach local tracks if we have them
+    const ls = localStreamRef.current;
+    if (ls) ls.getTracks().forEach((t) => pc.addTrack(t, ls));
     return pc;
   };
 
-  const cleanupPeer = (peerId) => {
-    const pc = pcsRef.current.get(peerId);
-    try { pc?.getSenders?.().forEach((s) => s.track && s.track.stop()); } catch {}
-    try { pc?.close?.(); } catch {}
-    pcsRef.current.delete(peerId);
-
-    const ms = remoteStreamsRef.current.get(peerId);
-    if (ms) { try { ms.getTracks().forEach((t) => t.stop()); } catch {} }
-    remoteStreamsRef.current.delete(peerId);
-
-    if (mainRemoteRef.current?.srcObject === ms) {
-      mainRemoteRef.current.srcObject = null;
-      for (const [, stream] of remoteStreamsRef.current) {
-        mainRemoteRef.current.srcObject = stream; break;
-      }
-    }
-    setPeerIds((list) => list.filter((id) => id !== peerId));
+  const ensureLocal = async (kind) => {
+    if (localStreamRef.current) return localStreamRef.current;
+    const constraints = kind === "audio" ? AUDIO_ONLY : LOW_VIDEO;
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    localStreamRef.current = stream;
+    if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+    return stream;
   };
 
-  /* ---------- calling flow (mesh) ---------- */
-  const preflight = async (kind) => {
+  const makeOfferTo = async (peerId) => {
     try {
-      setStatus("Requesting mic/camera…");
-      const t = await navigator.mediaDevices.getUserMedia(kind === "audio" ? AUDIO_ONLY : LOW_VIDEO);
-      t.getTracks().forEach((x) => x.stop());
-      return true;
-    } catch {
-      setStatus("Permission denied or device not available");
-      return false;
+      const pc = ensurePC(peerId);
+      // prepare local if not ready
+      await ensureLocal(voiceOnly ? "audio" : "video");
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socketRef.current?.emit("rtc:offer", { roomId: room?.code, offer, to: peerId });
+    } catch (e) {
+      console.error(e);
     }
   };
 
-  const startOfferTo = async (peerId, kind, ms) => {
-    const pc = makePC(peerId);
-    ms.getTracks().forEach((t) => pc.addTrack(t, ms));
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    socketRef.current?.emit("rtc:offer", { roomId: room.code, to: peerId, offer, kind });
-  };
-
-  const toggleCall = async () => {
-    if (!room?.code) return;
-
-    if (calling || inCall) { hangUp(); return; }
-
-    const kind = voiceOnly ? "audio" : "video";
-    setCalling(true);
+  /* --------------------------
+     Call controls
+  --------------------------- */
+  const startCallHost = async () => {
+    if (!isHost || !room?.code) return;
     setStarting(true);
-
-    try { await ringBackRef.current?.play(); } catch {}
-
-    const ok = await preflight(kind);
-    if (!ok) { setCalling(false); setStarting(false); return; }
-
+    setStatus("Starting call…");
     try {
-      const ms = await getStream(kind);
-      setStatus("Calling…"); setNet("Connecting");
+      await ensureLocal(voiceOnly ? "audio" : "video");
 
-      socketRef.current?.emit("rtc:join", { roomId: room.code });
+      // Join the room’s “call channel” (same code) so we receive rtc:peer-joined
+      socketRef.current.emit("rtc:join", { roomId: room.code });
 
-      const others = peerIds.filter((id) => id !== myId);
-      await Promise.all(others.map((pid) => startOfferTo(pid, kind, ms)));
+      // Create offers to everyone already in the room
+      const { sockets } = await socketRef.current.emitWithAck?.("room:list-peers", { roomId: room.code }).catch(() => ({ sockets: [] })) || {};
+      (sockets || [])
+        .filter((id) => id !== socketRef.current.id)
+        .forEach((id) => makeOfferTo(id));
 
-      clearTimeout(offerTimeoutRef.current);
-      clearTimeout(offerBackupRef.current);
-      offerTimeoutRef.current = setTimeout(() => {
-        if (!inCall) { stopRings(); setStatus("No answer"); addMsg({ sys: true, ts: Date.now(), text: "Call ended: no answer" }); hangUp(); }
-      }, 20000);
-      offerBackupRef.current = setTimeout(() => {
-        if (!inCall) { stopRings(); setStatus("No answer"); addMsg({ sys: true, ts: Date.now(), text: "Call ended: no answer (backup)" }); hangUp(); }
-      }, 35000);
+      try { await ringBackRef.current?.play(); } catch {}
+      setInCall(true);
+      setStarting(false);
+      setStatus("");
     } catch (e) {
       console.error(e);
-      setCalling(false); setStarting(false); setStatus(""); stopRings();
+      setStarting(false);
+      setStatus("Failed to start");
     }
   };
 
-  const acceptIncoming = async () => {
-    const inc = incoming;
-    if (!inc) return;
-    stopRings();
-    setIncoming(null);
-
+  const joinCallGuest = async () => {
+    if (!room?.code) return;
+    setStarting(true);
+    setStatus("Joining…");
     try {
-      setStatus("Answering…");
-      const kind = inc.kind || "video";
-      const ms = await getStream(kind);
-
-      const pc = makePC(inc.from);
-      ms.getTracks().forEach((t) => pc.addTrack(t, ms));
-
-      await pc.setRemoteDescription(inc.sdp);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-
-      socketRef.current?.emit("rtc:answer", { roomId: room?.code, to: inc.from, answer });
-      setNet("Connecting"); setStatus("Connecting…");
+      await ensureLocal(voiceOnly ? "audio" : "video");
+      socketRef.current.emit("rtc:join", { roomId: room.code });
+      setInCall(true);
+      setStarting(false);
+      setStatus("");
     } catch (e) {
       console.error(e);
-      hangUp();
+      setStarting(false);
+      setStatus("Failed to join");
     }
   };
 
-  const declineIncoming = () => {
-    stopRings();
-    setIncoming(null);
-  };
+  const leaveCall = () => {
+    try { ringBackRef.current?.pause(); } catch {}
+    setInCall(false);
+    setStarting(false);
+    setStatus("");
+    setNet("Idle");
+    setMuted(false);
+    setVideoOff(false);
+    setMainVideo("remote");
 
-  const hangUp = () => {
-    stopRings();
-    setCalling(false); setStarting(false); setInCall(false);
-    setStatus(""); setNet("Idle");
-    setMuted(false); setVideoOff(false); setMainVideo("remote");
-    clearTimeout(offerTimeoutRef.current); clearTimeout(offerBackupRef.current);
+    // close pcs
+    pcsRef.current.forEach((pc) => { try { pc.close(); } catch {} });
+    pcsRef.current.clear();
+    remMediaRef.current.clear();
+    updatePeersView();
 
-    for (const pid of [...pcsRef.current.keys()]) cleanupPeer(pid);
-
-    const s = localRef.current?.srcObject;
-    if (s) { s.getTracks().forEach((t) => t.stop()); localRef.current.srcObject = null; }
-    if (mainRemoteRef.current?.srcObject) mainRemoteRef.current.srcObject = null;
+    // stop local
+    const s = localStreamRef.current;
+    if (s) { s.getTracks().forEach((t) => t.stop()); }
+    localStreamRef.current = null;
+    if (localVideoRef.current) localVideoRef.current.srcObject = null;
 
     socketRef.current?.emit("rtc:leave", { roomId: room?.code });
   };
 
-  /* ---------- chat ---------- */
-  const sendChat = () => {
-    const t = text.trim(); if (!t) return;
-    const mine = { name: me, ts: Date.now(), text: t };
-    seenRecently(mine); addMsg(mine);
-    socketRef.current?.emit("chat", t); setText("");
-  };
-
-  /* ---------- local controls ---------- */
   const toggleMute = () => {
-    const tracks = localRef.current?.srcObject?.getAudioTracks?.() || [];
+    const tracks = localStreamRef.current?.getAudioTracks?.() || [];
     tracks.forEach((t) => (t.enabled = !t.enabled));
     setMuted((v) => !v);
   };
   const toggleVideo = () => {
-    const tracks = localRef.current?.srcObject?.getVideoTracks?.() || [];
+    const tracks = localStreamRef.current?.getVideoTracks?.() || [];
     tracks.forEach((t) => (t.enabled = !t.enabled));
     setVideoOff((v) => !v);
   };
+
+  // Host-only controls (no-ops if server doesn’t support, but safe to emit)
+  const lockRoom = () => socketRef.current.emit("room:lock", { roomId: room?.code, lock: !room?.locked });
+  const muteAll = () => socketRef.current.emit("mute:all", { roomId: room?.code });
+  const endCallAll = () => { socketRef.current.emit("call:endall", { roomId: room?.code }); leaveCall(); };
+
   const copyInvite = async () => {
     if (!room?.code) return;
     const url = new URL(location.href);
@@ -465,59 +407,105 @@ export default function App() {
     setStatus("Invite link copied");
   };
 
-  /* ---------- host actions ---------- */
-  const hostLock = (on) => socketRef.current?.emit("host:lock", !!on, (res) => {
-    if (!res?.ok) setStatus(res?.error || "Lock failed");
-  });
-  const hostMuteAll = () => socketRef.current?.emit("host:mute-all");
-  const hostEndCall = () => socketRef.current?.emit("host:endcall");
-  const hostKick = (peerId) => socketRef.current?.emit("host:kick", { peerId });
+  /* --------------------------
+     Render helpers
+  --------------------------- */
+  const callButton = (() => {
+    if (!room) return null;
+    if (inCall) {
+      return (
+        <button className="btn danger" onClick={leaveCall}>
+          Leave call
+        </button>
+      );
+    }
+    if (isHost) {
+      return (
+        <button className="btn primary" disabled={starting} onClick={startCallHost}>
+          {starting ? "Starting…" : "Start call"}
+        </button>
+      );
+    }
+    return (
+      <button className="btn primary" disabled={starting} onClick={joinCallGuest}>
+        {starting ? "Joining…" : "Join call"}
+      </button>
+    );
+  })();
 
-  const callButtonLabel = calling || inCall ? "End Call" : "Start Call";
-
-  /* ---------- UI ---------- */
   return (
     <div className="shell">
-      {/* hidden audio players */}
-      <audio ref={ringInRef} src="/sounds/incoming.mp3" preload="auto" loop />
-      <audio ref={ringBackRef} src="/sounds/ringback.mp3" preload="auto" loop />
+      {/* hidden ring sounds */}
+      <audio ref={ringInRef} src="/sounds/incoming.mp3" loop />
+      <audio ref={ringBackRef} src="/sounds/ringback.mp3" loop />
 
       <div className="glass">
         <header className="head">
-          <h1>H2N Forum {isHost ? "— Host" : ""}</h1>
+          <h1>{isHost ? "H2N Forum — Host" : "H2N Forum"}</h1>
           <span className={`pill ${connected ? "ok" : ""}`}>
             {connected ? "Connected to server" : "Disconnected"}
           </span>
 
-          <button className="chip" onClick={() => { setShowNameEdit((v) => !v); setNameDraft(me); }}>
-            <span className="chip-label">You:</span><b className="chip-name">{me}</b><span className="chip-edit">✎</span>
+          <button
+            className="chip"
+            onClick={() => { setShowNameEdit((v) => !v); setNameDraft(me); }}
+            title="Edit your display name"
+          >
+            <span className="chip-label">You:</span>
+            <b className="chip-name">{me}</b>
+            {isHost && <span className="badge-host">Host</span>}
+            <span className="chip-edit">✎</span>
           </button>
 
           {showNameEdit && (
             <div className="name-pop">
-              <div className="name-row"><input value={nameDraft} onChange={(e) => setNameDraft(e.target.value)} /></div>
+              <div className="name-row">
+                <input value={nameDraft} onChange={(e) => setNameDraft(e.target.value)} />
+              </div>
               <div className="name-actions">
                 <button className="btn" onClick={() => setShowNameEdit(false)}>Cancel</button>
-                <button className="btn primary" onClick={() => { setMe(nameDraft.trim() || "Me"); setShowNameEdit(false); }}>Save</button>
+                <button
+                  className="btn primary"
+                  onClick={() => { setMe(nameDraft.trim() || "Me"); setShowNameEdit(false); }}
+                >
+                  Save
+                </button>
               </div>
             </div>
           )}
         </header>
 
+        {/* LOBBY (not in a room) */}
         {!room && (
           <>
             <div className="row title">Create a meeting</div>
             <div className="row">
-              <input placeholder="Room name (optional)" value={roomName} onChange={(e) => setRoomName(e.target.value)} />
-              <input placeholder="PIN (4–6 digits, optional)" value={pin} onChange={(e) => setPin(e.target.value)} />
-              <button className="btn primary" onClick={createRoom}>Create Meeting</button>
+              <input
+                placeholder="Room name (optional)"
+                value={roomName}
+                onChange={(e) => setRoomName(e.target.value)}
+              />
+              <input
+                placeholder="PIN (4–6 digits, optional)"
+                value={pin}
+                onChange={(e) => setPin(e.target.value)}
+              />
+              <button className="btn primary" onClick={createRoom}>Create room</button>
             </div>
 
             <div className="row title right">Code + optional PIN</div>
             <div className="row">
-              <input placeholder="6-digit code" value={joinCode} onChange={(e) => setJoinCode(e.target.value)} />
-              <input placeholder="PIN (if required)" value={joinPin} onChange={(e) => setJoinPin(e.target.value)} />
-              <button className="btn" onClick={joinRoom}>Join</button>
+              <input
+                placeholder="6-digit code"
+                value={joinCode}
+                onChange={(e) => setJoinCode(e.target.value)}
+              />
+              <input
+                placeholder="PIN (if required)"
+                value={joinPin}
+                onChange={(e) => setJoinPin(e.target.value)}
+              />
+              <button className="btn" onClick={joinRoom}>Join room</button>
             </div>
 
             <div className="hint">
@@ -526,108 +514,97 @@ export default function App() {
           </>
         )}
 
+        {/* IN ROOM */}
         {room && (
           <>
             <div className="row">
               <div className="inroom">
-                In room: <b>{room.name}</b> <span className="mono">({room.code})</span>
-                {room.locked && <span className="pill">Locked</span>}
-                <button className="link" onClick={copyInvite}>Copy invite</button>
+                In room: <b>{room.name}</b>{" "}
+                <span className="mono">({room.code})</span>
+                <button className="btn ghost" onClick={copyInvite}>Copy invite</button>
                 <button className="link" onClick={leaveRoom}>Leave</button>
               </div>
             </div>
 
+            {/* host/guest call controls */}
             <div className="row callbar">
               <label className="chk">
-                <input type="checkbox" checked={voiceOnly} onChange={(e) => setVoiceOnly(e.target.checked)} />
+                <input
+                  type="checkbox"
+                  checked={voiceOnly}
+                  onChange={(e) => setVoiceOnly(e.target.checked)}
+                  disabled={inCall}
+                />
                 <span>Voice only</span>
               </label>
 
-              <button className={`btn ${calling || inCall ? "danger" : ""}`} onClick={toggleCall} disabled={!connected || starting}>
-                {starting ? "Starting…" : callButtonLabel}
-              </button>
-              <button className="btn" onClick={toggleMute} disabled={!inCall}>{muted ? "Unmute" : "Mute"}</button>
-              <button className="btn" onClick={toggleVideo} disabled={!inCall || voiceOnly}>{videoOff ? "Camera On" : "Camera Off"}</button>
+              {callButton}
 
-              {/* Host-only moderation */}
+              <button className="btn" onClick={toggleMute} disabled={!inCall}>
+                {muted ? "Unmute" : "Mute"}
+              </button>
+              <button className="btn" onClick={toggleVideo} disabled={!inCall || voiceOnly}>
+                {videoOff ? "Camera On" : "Camera Off"}
+              </button>
+
               {isHost && (
                 <>
-                  <button className="btn" onClick={() => hostLock(!room.locked)}>{room.locked ? "Unlock" : "Lock"} room</button>
-                  <button className="btn" onClick={hostMuteAll}>Mute all</button>
-                  <button className="btn danger" onClick={hostEndCall}>End call for all</button>
+                  <button className="btn" onClick={lockRoom}>
+                    {room?.locked ? "Unlock room" : "Lock room"}
+                  </button>
+                  <button className="btn" onClick={muteAll} disabled={!inCall}>
+                    Mute all
+                  </button>
+                  <button className="btn danger" onClick={endCallAll}>
+                    End call for all
+                  </button>
                 </>
               )}
             </div>
 
-            {/* Kick list (host only) */}
-            {isHost && peerIds.length > 0 && (
-              <div className="hint">
-                Participants:{" "}
-                {peerIds.map((pid, i) => (
-                  <button key={pid} className="link" onClick={() => hostKick(pid)}>
-                    Kick #{i + 1}
-                  </button>
-                ))}
+            {/* waiting message for guests when not in a call yet */}
+            {!isHost && !inCall && (
+              <div className="banner-wait">
+                Waiting for the host to start the call. You’ll be able to <b>Join call</b> once it starts.
               </div>
             )}
 
             {status && <div className="hint">{status}</div>}
 
-            {/* incoming call */}
-            {incoming && (
-              <div className="incoming">
-                <div className="box">
-                  <div className="title">Incoming {incoming.kind === "audio" ? "voice" : "video"} call</div>
-                  <div className="buttons">
-                    <button className="btn primary" onClick={acceptIncoming}>Accept</button>
-                    <button className="btn danger" onClick={declineIncoming}>Decline</button>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* media */}
+            {/* MEDIA AREA
+                - local video always rendered
+                - remote peers show as first big tile + small tiles (pip-like) */}
             {!voiceOnly && (
               <div className="media single">
                 <div className="remotePane">
-                  {/* Main remote */}
-                  <video
-                    ref={mainRemoteRef}
-                    autoPlay playsInline
-                    className={mainVideo === "remote" ? (videoFitContain ? "fit" : "") : "pip"}
+                  {/* main tile: if any peer streams exist, show the first one; else show local */}
+                  <VideoTile
+                    stream={
+                      remMediaRef.current.size
+                        ? remMediaRef.current.values().next().value
+                        : localStreamRef.current
+                    }
+                    main
+                    fit={videoFitContain}
                     onClick={() => setMainVideo("remote")}
                     onDoubleClick={() => setVideoFitContain((v) => !v)}
                   />
 
-                  {/* Local */}
-                  <video
-                    ref={localRef}
-                    autoPlay playsInline muted
-                    className={mainVideo === "local" ? (videoFitContain ? "fit" : "") : "pip"}
+                  {/* local pip */}
+                  <VideoTile
+                    stream={localStreamRef.current}
+                    pip
+                    fit={videoFitContain}
                     onClick={() => setMainVideo("local")}
                     onDoubleClick={() => setVideoFitContain((v) => !v)}
+                    refEl={localVideoRef}
                   />
 
-                  {/* Extra remotes as PiPs */}
-                  {peerIds
-                    .filter((pid) => remoteStreamsRef.current.has(pid))
-                    .map((pid) => (
-                      <video
-                        key={pid}
-                        autoPlay playsInline muted className="pip"
-                        ref={(el) => {
-                          if (!el) return;
-                          const ms = remoteStreamsRef.current.get(pid);
-                          if (ms && el.srcObject !== ms) el.srcObject = ms;
-                        }}
-                        onClick={() => {
-                          const ms = remoteStreamsRef.current.get(pid);
-                          if (ms && mainRemoteRef.current) {
-                            mainRemoteRef.current.srcObject = ms;
-                            setMainVideo("remote");
-                          }
-                        }}
-                      />
+                  {/* additional remote pips */}
+                  {Array.from(remMediaRef.current.entries())
+                    .slice(1) // first one is in the main tile
+                    .map(([peerId, stream]) => (
+                      <SmallPip key={peerId} stream={stream} />
                     ))}
                 </div>
               </div>
@@ -661,11 +638,56 @@ export default function App() {
             placeholder="Type a message… (Enter to send, Shift+Enter for new line)"
             value={text}
             onChange={(e) => setText(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); } }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                sendChat();
+              }
+            }}
           />
           <button className="btn primary" onClick={sendChat}>Send</button>
         </div>
       </div>
     </div>
   );
+}
+
+/* --------------------------
+   Small components
+--------------------------- */
+function VideoTile({ stream, main, pip, fit, onClick, onDoubleClick, refEl }) {
+  const vref = useRef(null);
+  useEffect(() => {
+    const v = refEl || vref.current;
+    if (v && stream && v.srcObject !== stream) v.srcObject = stream;
+  }, [stream, refEl]);
+
+  return (
+    <video
+      ref={refEl || vref}
+      autoPlay
+      playsInline
+      muted={pip || !main} /* local/pip stays muted */
+      className={
+        pip
+          ? "pip"
+          : fit
+          ? "fit"
+          : ""
+      }
+      onClick={onClick}
+      onDoubleClick={onDoubleClick}
+      style={pip ? undefined : { width: "100%" }}
+    />
+  );
+}
+
+function SmallPip({ stream }) {
+  const vref = useRef(null);
+  useEffect(() => {
+    if (vref.current && stream && vref.current.srcObject !== stream) {
+      vref.current.srcObject = stream;
+    }
+  }, [stream]);
+  return <video ref={vref} autoPlay playsInline className="pip" />;
 }
