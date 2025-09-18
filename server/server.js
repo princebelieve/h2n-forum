@@ -1,124 +1,77 @@
-// server/server.js
-// H2N Forum — Express + Socket.IO signaling server
-// Features:
-// - CORS allow-list via ORIGINS env (no code changes when you add domains)
-// - Rooms (create/join/leave), chat
-// - Multi-peer (mesh) WebRTC signaling for group voice/video
-// - Health endpoint
+// server.js
+require("dotenv").config();
+const express = require("express");
+const http = require("http");
+const { Server } = require("socket.io");
+const cors = require("cors");
 
-import express from "express";
-import http from "http";
-import cors from "cors";
-import { Server } from "socket.io";
+const app = express();
+const server = http.createServer(app);
 
-/* =========================
-   Config (env-driven)
-   ========================= */
-const PORT = process.env.PORT || 3001;
-
-// Comma-separated list of allowed origins. Example:
-// ORIGINS="https://h2nforum.vercel.app,https://your-domain.com"
-const ORIGINS = (process.env.ORIGINS || "https://h2nforum.vercel.app,http://localhost:5173")
+/* ---------------------------
+   CORS Setup
+---------------------------- */
+const rawOrigins = process.env.CLIENT_ORIGIN || "";
+const ALLOWED = rawOrigins
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
 
-// Helper used by Express + Socket.IO
-function isAllowedOrigin(origin) {
-  if (!origin) return true; // same-origin/curl
-  try {
-    const o = new URL(origin).origin;
-    return ORIGINS.includes(o);
-  } catch {
-    return false;
-  }
+function originOk(reqOrigin) {
+  if (!reqOrigin) return true; // same-origin
+  return ALLOWED.some(o => reqOrigin === o || reqOrigin.startsWith(o));
 }
 
-/* =========================
-   Express + HTTP
-   ========================= */
-const app = express();
+app.use(
+  cors({
+    origin: (origin, cb) => (originOk(origin) ? cb(null, true) : cb(new Error("Not allowed by CORS"))),
+    credentials: true,
+  })
+);
 
-app.use(cors({
-  origin: (origin, cb) => cb(null, isAllowedOrigin(origin)),
-  credentials: true
-}));
-
-app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    service: "H2N Forum Signaling",
-    allowed: ORIGINS,
-    ts: Date.now()
-  });
-});
-
-const server = http.createServer(app);
-
-/* =========================
-   Socket.IO
-   ========================= */
 const io = new Server(server, {
   cors: {
-    origin: (origin, cb) => cb(null, isAllowedOrigin(origin)),
-    credentials: true
+    origin: (origin, cb) => (originOk(origin) ? cb(null, true) : cb(new Error("Not allowed by CORS"))),
+    credentials: true,
   },
-  transports: ["websocket", "polling"]
 });
 
-// In-memory rooms + peers
-const rooms = new Map();            // code -> { code, name, pin, createdAt }
-const roomPeers = new Map();        // code -> Set(socketId)
-const ROOM_EMPTY_TTL = 30_000;
+/* ---------------------------
+   State
+---------------------------- */
+const rooms = new Map();
 
-function getPeers(code) {
-  if (!roomPeers.has(code)) roomPeers.set(code, new Set());
-  return roomPeers.get(code);
-}
-function cleanupIfEmpty(code) {
-  const peers = roomPeers.get(code);
-  if (!peers || peers.size === 0) {
-    roomPeers.delete(code);
-    rooms.delete(code);
-  }
-}
-
+/* ---------------------------
+   Socket Logic
+---------------------------- */
 io.on("connection", (socket) => {
-  socket.data.name = `User-${socket.id.slice(0,4)}`;
-  socket.data.roomCode = null;
+  socket.data.name = "Guest";
 
-  /* --- Identity (optional) --- */
-  socket.on("set-name", (name = "", ack) => {
-    const n = String(name || "").trim().slice(0, 40);
-    if (n) socket.data.name = n;
-    ack?.({ ok: true, name: socket.data.name });
+  socket.on("set-name", (name) => {
+    socket.data.name = String(name || "").trim() || "Guest";
   });
 
-  /* --- Create room --- */
-  socket.on("create-room", ({ name = "Room", code, pin } = {}, ack) => {
-    const roomName = String(name || "Room").slice(0, 60);
-    const roomCode = String(code || Math.floor(100000 + Math.random()*900000)).trim();
-    if (rooms.has(roomCode)) return ack?.({ ok: false, error: "Code already in use" });
+  /* ---- Create room ---- */
+  socket.on("create-room", ({ code, name, pin } = {}, ack) => {
+    if (!code) return ack?.({ ok: false, error: "Missing room code" });
 
-    const room = { code: roomCode, name: roomName, pin: pin ? String(pin) : null, createdAt: Date.now() };
-    rooms.set(roomCode, room);
+    const room = { code, name: name || "Room", pin: pin ? String(pin) : null };
+    rooms.set(code, room);
 
-    // join creator
-    if (socket.data.roomCode) {
-      getPeers(socket.data.roomCode).delete(socket.id);
-      socket.leave(socket.data.roomCode);
-    }
-    socket.join(roomCode);
-    socket.data.roomCode = roomCode;
-    getPeers(roomCode).add(socket.id);
+    if (socket.data.roomCode) socket.leave(socket.data.roomCode);
+    socket.join(code);
+    socket.data.roomCode = code;
 
-    ack?.({ ok: true, room: { code: roomCode, name: roomName, requiresPin: !!room.pin } });
+    ack?.({ ok: true, room: { code, name: room.name, requiresPin: !!room.pin } });
 
-    io.to(roomCode).emit("chat", { sys: true, ts: Date.now(), text: `Created room: ${roomName} (${roomCode})` });
-    io.to(roomCode).emit("rtc:peers", { roomId: roomCode, peers: [...getPeers(roomCode)] });
+    io.to(code).emit("chat", {
+      sys: true,
+      ts: Date.now(),
+      text: `Created room: ${room.name} (${code})`,
+    });
   });
 
-  /* --- Join room --- */
+  /* ---- Join room ---- */
   socket.on("join-room", ({ code, pin } = {}, ack) => {
     const key = String(code || "").trim();
     const room = rooms.get(key);
@@ -127,113 +80,107 @@ io.on("connection", (socket) => {
       return ack?.({ ok: false, error: "Incorrect PIN" });
     }
 
-    // move socket to room
-    if (socket.data.roomCode) {
-      getPeers(socket.data.roomCode).delete(socket.id);
-      socket.leave(socket.data.roomCode);
-      cleanupIfEmpty(socket.data.roomCode);
-    }
-    socket.join(key);
-    socket.data.roomCode = key;
-    getPeers(key).add(socket.id);
+    if (socket.data.roomCode) socket.leave(socket.data.roomCode);
+    socket.join(room.code);
+    socket.data.roomCode = room.code;
 
-    ack?.({ ok: true, room: { code: key, name: room.name, requiresPin: !!room.pin } });
+    ack?.({ ok: true, room: { code: room.code, name: room.name, requiresPin: !!room.pin } });
 
-    io.to(key).emit("chat", { sys: true, ts: Date.now(), text: `${socket.data.name} joined` });
-    io.to(key).emit("rtc:peers", { roomId: key, peers: [...getPeers(key)] });
+    io.to(room.code).emit("chat", {
+      sys: true,
+      ts: Date.now(),
+      text: `${socket.data.name} joined`,
+    });
   });
 
-  /* --- Leave room --- */
+  /* ---- Leave room ---- */
   function leaveCurrentRoom() {
     const code = socket.data.roomCode;
     if (!code) return;
-    getPeers(code).delete(socket.id);
     socket.leave(code);
     socket.data.roomCode = null;
-
-    io.to(code).emit("chat", { sys: true, ts: Date.now(), text: `${socket.data.name} left` });
-    io.to(code).emit("rtc:peer-left", { peerId: socket.id });
-    io.to(code).emit("rtc:peers", { roomId: code, peers: [...getPeers(code)] });
-
-    setTimeout(() => cleanupIfEmpty(code), 15_000);
+    io.to(code).emit("chat", {
+      sys: true,
+      ts: Date.now(),
+      text: `${socket.data.name} left`,
+    });
+    // delete empty rooms after 30s
+    setTimeout(async () => {
+      const sockets = await io.in(code).fetchSockets();
+      if (sockets.length === 0) rooms.delete(code);
+    }, 30_000);
   }
   socket.on("leave-room", leaveCurrentRoom);
 
-  /* --- Chat --- */
+  /* ---- Chat ---- */
   const handleChat = (payload) => {
     const code = socket.data.roomCode;
     if (!code) return;
-    const msg = typeof payload === "string"
-      ? { name: socket.data.name, text: payload, ts: Date.now() }
-      : { name: payload?.from || socket.data.name, text: String(payload?.text ?? ""), ts: payload?.ts || Date.now() };
+    const msg =
+      typeof payload === "string"
+        ? { name: socket.data.name, text: payload, ts: Date.now() }
+        : {
+            name: payload?.from || socket.data.name,
+            text: String(payload?.text ?? ""),
+            ts: payload?.ts || Date.now(),
+          };
     io.to(code).emit("chat", msg);
-    io.to(code).emit("message", msg); // legacy alias
   };
   socket.on("chat", handleChat);
   socket.on("chat:send", handleChat);
   socket.on("message", handleChat);
 
-  /* --- WebRTC signaling (mesh) --- */
+  /* ---- WebRTC Signaling (supports group calls) ---- */
   socket.on("rtc:join", ({ roomId } = {}) => {
     const rid = String(roomId || "").trim();
     if (!rid) return;
     if (socket.data.roomCode !== rid) {
-      if (socket.data.roomCode) {
-        getPeers(socket.data.roomCode).delete(socket.id);
-        socket.leave(socket.data.roomCode);
-      }
+      if (socket.data.roomCode) socket.leave(socket.data.roomCode);
       socket.join(rid);
       socket.data.roomCode = rid;
-      getPeers(rid).add(socket.id);
     }
     socket.to(rid).emit("rtc:peer-joined", { peerId: socket.id });
-    io.to(rid).emit("rtc:peers", { roomId: rid, peers: [...getPeers(rid)] });
   });
 
   socket.on("rtc:leave", ({ roomId } = {}) => {
     const rid = roomId || socket.data.roomCode;
     if (!rid) return;
-    getPeers(rid).delete(socket.id);
     socket.to(rid).emit("rtc:peer-left", { peerId: socket.id });
-    socket.leave(rid);
-    if (socket.data.roomCode === rid) socket.data.roomCode = null;
-    io.to(rid).emit("rtc:peers", { roomId: rid, peers: [...getPeers(rid)] });
-    setTimeout(() => cleanupIfEmpty(rid), 15_000);
+    if (socket.data.roomCode === rid) socket.leave(rid);
   });
 
   socket.on("rtc:offer", ({ roomId, offer }) => {
     const rid = roomId || socket.data.roomCode;
-    if (!rid || !offer) return;
-    socket.to(rid).emit("rtc:offer", { from: socket.id, offer });
+    if (rid && offer) {
+      socket.to(rid).emit("rtc:offer", { from: socket.id, offer });
+    }
   });
 
   socket.on("rtc:answer", ({ roomId, answer }) => {
     const rid = roomId || socket.data.roomCode;
-    if (!rid || !answer) return;
-    socket.to(rid).emit("rtc:answer", { from: socket.id, answer });
+    if (rid && answer) {
+      socket.to(rid).emit("rtc:answer", { from: socket.id, answer });
+    }
   });
 
   socket.on("rtc:ice", ({ roomId, candidate }) => {
     const rid = roomId || socket.data.roomCode;
-    if (!rid || !candidate) return;
-    socket.to(rid).emit("rtc:ice", { from: socket.id, candidate });
+    if (rid && candidate) {
+      socket.to(rid).emit("rtc:ice", { from: socket.id, candidate });
+    }
   });
 
   socket.on("disconnect", () => {
     const rid = socket.data.roomCode;
-    if (rid) {
-      getPeers(rid).delete(socket.id);
-      socket.to(rid).emit("rtc:peer-left", { peerId: socket.id });
-      io.to(rid).emit("rtc:peers", { roomId: rid, peers: [...getPeers(rid)] });
-      setTimeout(() => cleanupIfEmpty(rid), 15_000);
-    }
+    if (rid) socket.to(rid).emit("rtc:peer-left", { peerId: socket.id });
   });
 });
 
-/* =========================
-   Start
-   ========================= */
+/* ---------------------------
+   Start Server
+---------------------------- */
+const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`H2N Forum server listening on http://localhost:${PORT}`);
-  console.log("Allowed origins:", ORIGINS.join(", "));
+  console.log(`H2N Forum server running on port ${PORT}`);
+  console.log("Allowed CORS origins:", ALLOWED.length ? ALLOWED : "(none)");
 });
