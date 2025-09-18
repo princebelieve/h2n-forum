@@ -3,91 +3,96 @@ import { useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import "./App.css";
 
-// SERVER_URL from Vite env
+// --- config ---
 const SERVER_URL = (import.meta.env.VITE_SERVER_URL || "").split(",")[0].trim();
-
-// STUN (add TURN later if you want)
-const ICE = {
-  iceServers: [
-    { urls: ["stun:stun.l.google.com:19302"] },
-    // { urls: "turn:YOUR_TURN_HOST:3478", username: "XXX", credential: "YYY" },
-  ],
-};
-
-// media constraints
+const ICE = { iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }] };
 const AUDIO_ONLY = { audio: { echoCancellation: true, noiseSuppression: true }, video: false };
 const LOW_VIDEO = {
   audio: { echoCancellation: true, noiseSuppression: true },
   video: { width: { ideal: 640, max: 640 }, height: { ideal: 360, max: 360 }, frameRate: { max: 15 }, facingMode: "user" },
 };
 
+// --- helpers for localStorage ---
+const LS = {
+  getName: () => localStorage.getItem("me") || "Me",
+  setName: (v) => localStorage.setItem("me", v),
+  saveHostToken: (code, token) => localStorage.setItem("h2n_host", JSON.stringify({ code, token })),
+  readHostToken: () => {
+    try { return JSON.parse(localStorage.getItem("h2n_host") || "null"); } catch { return null; }
+  },
+  clearHostToken: () => localStorage.removeItem("h2n_host"),
+};
+
 export default function App() {
-  // sockets / rtc
+  // socket / rtc
   const socketRef = useRef(null);
   const pcRef = useRef(null);
 
-  // media
+  // media els
   const localRef = useRef(null);
   const remoteRef = useRef(null);
 
-  // sounds (optional files under /public/sounds)
-  const ringInRef = useRef(null);
-  const ringBackRef = useRef(null);
-
-  // identity + server
+  // ui/state
   const [connected, setConnected] = useState(false);
-  const [sid, setSid] = useState(null);
-  const [me, setMe] = useState(() => localStorage.getItem("me") || "Me");
-  const [showNameEdit, setShowNameEdit] = useState(false);
-  const [nameDraft, setNameDraft] = useState(me);
+  const [socketId, setSocketId] = useState(null);
+  const [me, setMe] = useState(LS.getName);
 
-  // room + chat
-  const [room, setRoom] = useState(null); // {code,name,hostId,locked,live}
+  const [room, setRoom] = useState(null); // { code, name, hostId, locked, live }
   const [roomName, setRoomName] = useState("");
   const [pin, setPin] = useState("");
   const [joinCode, setJoinCode] = useState("");
   const [joinPin, setJoinPin] = useState("");
-  const [msgs, setMsgs] = useState([]);
-  const msgsRef = useRef(null);
 
-  // call state
   const [voiceOnly, setVoiceOnly] = useState(false);
-  const [starting, setStarting] = useState(false);
   const [inCall, setInCall] = useState(false);
   const [muted, setMuted] = useState(false);
   const [videoOff, setVideoOff] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [joining, setJoining] = useState(false);
 
-  // UI
-  const [mainVideo, setMainVideo] = useState("remote");
-  const [fitContain, setFitContain] = useState(true);
+  const [msgs, setMsgs] = useState([]);
+  const msgsRef = useRef(null);
+
   const addMsg = (m) => setMsgs((p) => (p.length > 199 ? [...p.slice(-199), m] : [...p, m]));
-  const isHost = !!room && !!sid && room.hostId === sid;
+  const isHost = !!room && room.hostId === socketId;
 
-  // -------- socket setup --------
+  // --- socket setup ---
   useEffect(() => {
     const s = io(SERVER_URL, { transports: ["websocket"], reconnection: true });
     socketRef.current = s;
 
     s.on("connect", () => {
       setConnected(true);
-      setSid(s.id);
+      setSocketId(s.id);
       s.emit("hello", me);
-    });
-    s.on("disconnect", () => setConnected(false));
-    s.io.on("reconnect", () => setSid(s.id));
 
-    // chat + room flags
+      // try reclaim host on connect if we have a saved token
+      const saved = LS.readHostToken();
+      if (saved && room && saved.code === room.code) {
+        s.emit("claim-host", saved, (res) => {
+          if (res?.ok && res.room) setRoom(res.room);
+        });
+      }
+    });
+
+    s.on("disconnect", () => setConnected(false));
+    s.io.on("reconnect", () => setSocketId(s.id));
+
+    // chat + room updates
     s.on("chat", (m) => addMsg(m));
     s.on("room:live", (live) => setRoom((r) => (r ? { ...r, live } : r)));
     s.on("room:locked", (locked) => setRoom((r) => (r ? { ...r, locked } : r)));
 
-    // ---- broadcast signalling (host -> all) ----
+    // signalling
     s.on("rtc:offer", async ({ offer }) => {
-      // Any guest receives this when the host starts a call
-      if (pcRef.current) return;
+      // guest receives host's offer
+      if (pcRef.current) return; // already have a call
+      setJoining(false);
+
       const pc = setupPC();
       const ms = await getStream(voiceOnly ? "audio" : "video");
       ms.getTracks().forEach((t) => pc.addTrack(t, ms));
+
       await pc.setRemoteDescription(offer);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
@@ -95,103 +100,49 @@ export default function App() {
       setInCall(true);
     });
 
-    s.on("rtc:answer", async ({ answer, from }) => {
-      // host receives answers from guests
-      try {
-        await pcRef.current?.setRemoteDescription(answer);
-      } catch {}
+    s.on("rtc:answer", async ({ answer }) => {
+      try { await pcRef.current?.setRemoteDescription(answer); } catch {}
     });
 
     s.on("rtc:ice", async ({ candidate }) => {
-      if (!candidate) return;
-      try {
-        await pcRef.current?.addIceCandidate(candidate);
-      } catch {}
+      if (candidate) { try { await pcRef.current?.addIceCandidate(candidate); } catch {} }
     });
 
-    // ---- targeted signalling (late joiners) ----
-    s.on("rtc:need-offer", async ({ peerId }) => {
-      // host is asked to create an offer for a specific peer
-      if (!isHost || !room?.live) return;
-      const pc = setupPC(); // dedicated connection per host (we reuse pcRef)
-      const ms = await getStream(voiceOnly ? "audio" : "video");
-      ms.getTracks().forEach((t) => pc.addTrack(t, ms));
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      s.emit("rtc:offer-to", { offer, targetId: peerId });
+    s.on("end-call", () => {
+      leaveCall();
     });
-
-    s.on("rtc:offer-to", async ({ from, offer }) => {
-      // a guest receives targeted host offer after pressing Join
-      if (pcRef.current) return;
-      const pc = setupPC();
-      const ms = await getStream(voiceOnly ? "audio" : "video");
-      ms.getTracks().forEach((t) => pc.addTrack(t, ms));
-      await pc.setRemoteDescription(offer);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      s.emit("rtc:answer-to", { answer, targetId: from });
-      setInCall(true);
-    });
-
-    s.on("rtc:answer-to", async ({ answer }) => {
-      try {
-        await pcRef.current?.setRemoteDescription(answer);
-      } catch {}
-    });
-
-    s.on("rtc:ice-to", async ({ candidate }) => {
-      if (!candidate) return;
-      try {
-        await pcRef.current?.addIceCandidate(candidate);
-      } catch {}
-    });
-
-    // global end
-    s.on("end-call", () => leaveCall());
 
     return () => s.disconnect();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isHost, room?.live, voiceOnly]);
+  }, []);
 
-  // persist name + re-hello
+  // persist name + say hello
   useEffect(() => {
-    localStorage.setItem("me", me);
+    LS.setName(me);
     socketRef.current?.emit("hello", me);
   }, [me]);
 
-  // auto-scroll messages
+  // autoscroll chat
   useEffect(() => {
     msgsRef.current?.scrollTo({ top: msgsRef.current.scrollHeight, behavior: "smooth" });
   }, [msgs]);
 
-  // -------- rtc helpers --------
+  // --- rtc helpers ---
   const setupPC = () => {
     const pc = new RTCPeerConnection(ICE);
     pcRef.current = pc;
 
     pc.onicecandidate = (e) => {
-      if (!e.candidate) return;
-      const s = socketRef.current;
-      if (!s) return;
-
-      // If we're currently in a targeted handshake, use targeted path, else broadcast path
-      // We’ll just use broadcast and let server route host/guest:
-      s.emit("rtc:ice", { candidate: e.candidate });
+      if (e.candidate) socketRef.current?.emit("rtc:ice", { candidate: e.candidate });
     };
-
     pc.ontrack = (ev) => {
       const ms = ev.streams?.[0];
       if (remoteRef.current && ms) remoteRef.current.srcObject = ms;
     };
-
     pc.onconnectionstatechange = () => {
-      const st = pc.connectionState;
-      if (["disconnected", "failed", "closed"].includes(st)) {
-        leaveCall();
-      }
+      const s = pc.connectionState;
+      if (s === "disconnected" || s === "failed" || s === "closed") leaveCall();
     };
-
     return pc;
   };
 
@@ -202,48 +153,63 @@ export default function App() {
     return ms;
   };
 
-  // -------- rooms --------
+  // --- rooms ---
   const createRoom = () => {
-    socketRef.current?.emit("create-room", { name: roomName, pin }, (res) => {
+    socketRef.current?.emit("create-room", { name: roomName.trim(), pin: pin.trim() }, (res) => {
       if (!res?.ok) return addMsg({ sys: true, ts: Date.now(), text: "Create failed" });
       setRoom(res.room);
+      if (res.hostToken) LS.saveHostToken(res.room.code, res.hostToken);
       addMsg({ sys: true, ts: Date.now(), text: `Created room: ${res.room.name} (${res.room.code})` });
     });
   };
 
   const joinRoom = () => {
     socketRef.current?.emit("join-room", { code: joinCode.trim(), pin: joinPin.trim() }, (res) => {
-      if (!res?.ok) {
-        addMsg({ sys: true, ts: Date.now(), text: `Join failed: ${res?.error || ""}` });
-        return;
-      }
+      if (!res?.ok) return addMsg({ sys: true, ts: Date.now(), text: `Join failed: ${res?.error || ""}` });
       setRoom(res.room);
+      // we are a guest; ensure we don't keep any stale host token
+      LS.clearHostToken();
       addMsg({ sys: true, ts: Date.now(), text: `Joined room: ${res.room.name} (${res.room.code})` });
     });
   };
 
   const leaveRoom = () => {
     socketRef.current?.emit("leave-room");
+    LS.clearHostToken();
     setRoom(null);
     leaveCall();
     addMsg({ sys: true, ts: Date.now(), text: "Left room" });
   };
 
-  // -------- host controls --------
+  // --- host controls ---
+  const toggleLock = () => {
+    if (!isHost || !room) return;
+    socketRef.current?.emit("room:lock", !room.locked, (res) => {
+      if (res?.ok) setRoom((r) => ({ ...r, locked: res.locked }));
+    });
+  };
+
   const startCallHost = async () => {
     if (!isHost || inCall || !room) return;
     setStarting(true);
     try {
-      await new Promise((r) => socketRef.current?.emit("room:live", true, () => r()));
+      // mark room live first so guests can click Join
+      await new Promise((resolve) => socketRef.current?.emit("room:live", true, () => resolve()));
+
       const pc = setupPC();
       const ms = await getStream(voiceOnly ? "audio" : "video");
       ms.getTracks().forEach((t) => pc.addTrack(t, ms));
+
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      socketRef.current?.emit("rtc:offer", { offer }, () => {});
+      socketRef.current?.emit("rtc:offer", { offer });
+
       setInCall(true);
-    } catch {}
-    setStarting(false);
+    } catch (e) {
+      // ignore
+    } finally {
+      setStarting(false);
+    }
   };
 
   const endForAll = () => {
@@ -252,142 +218,118 @@ export default function App() {
     leaveCall();
   };
 
-  const toggleLock = () => {
-    if (!isHost) return;
-    socketRef.current?.emit("room:lock", !room.locked, (res) => {
-      if (res?.ok) setRoom((r) => ({ ...r, locked: res.locked }));
-    });
-  };
-
-  // -------- guest join --------
+  // --- guest join UX ---
   const joinCallGuest = async () => {
-    if (inCall || !room) return;
-    // Ask host for a targeted offer
-    socketRef.current?.emit("rtc:need-offer");
-    // prompt permissions early to speed up
+    if (!room?.live || inCall) return;
+    setJoining(true);
+    // prime permissions so the answer can be created instantly when offer arrives
     try {
-      const kind = voiceOnly ? "audio" : "video";
-      const ms = await navigator.mediaDevices.getUserMedia(kind === "audio" ? AUDIO_ONLY : LOW_VIDEO);
+      const c = voiceOnly ? AUDIO_ONLY : LOW_VIDEO;
+      const ms = await navigator.mediaDevices.getUserMedia(c);
       ms.getTracks().forEach((t) => t.stop());
     } catch {}
   };
 
-  // -------- common call controls --------
+  // --- media controls ---
+  const toggleMute = () => {
+    const ms = localRef.current?.srcObject;
+    if (!ms) return;
+    const next = !muted;
+    ms.getAudioTracks().forEach((t) => (t.enabled = !next));
+    setMuted(next);
+  };
+
+  const toggleVideo = () => {
+    const ms = localRef.current?.srcObject;
+    if (!ms) return;
+    const next = !videoOff;
+    ms.getVideoTracks().forEach((t) => (t.enabled = !next));
+    setVideoOff(next);
+  };
+
+  const swapVideos = () => {
+    if (!inCall) return;
+    localRef.current?.classList.toggle("pip");
+    remoteRef.current?.classList.toggle("pip");
+  };
+
+  // --- call teardown ---
   const leaveCall = () => {
     setInCall(false);
     setMuted(false);
     setVideoOff(false);
-    setMainVideo("remote");
 
-    try {
-      pcRef.current?.getSenders?.().forEach((s) => s.track && s.track.stop());
-    } catch {}
-    try {
-      pcRef.current?.close();
-    } catch {}
-    pcRef.current = null;
-
-    const s1 = localRef.current?.srcObject;
-    if (s1) {
-      s1.getTracks().forEach((t) => t.stop());
-      localRef.current.srcObject = null;
+    const pc = pcRef.current;
+    if (pc) {
+      pc.onicecandidate = null;
+      pc.ontrack = null;
+      pc.onconnectionstatechange = null;
+      pc.getSenders().forEach((s) => { try { s.track?.stop(); } catch {} });
+      pc.close();
+      pcRef.current = null;
     }
+
+    const ls = localRef.current?.srcObject;
+    if (ls) { ls.getTracks().forEach((t) => t.stop()); localRef.current.srcObject = null; }
     if (remoteRef.current?.srcObject) remoteRef.current.srcObject = null;
+
+    socketRef.current?.emit("end-call");
   };
 
-  const toggleMute = () => {
-    const tracks = localRef.current?.srcObject?.getAudioTracks?.() || [];
-    tracks.forEach((t) => (t.enabled = !t.enabled));
-    setMuted((v) => !v);
-  };
-
-  const toggleVideo = () => {
-    const tracks = localRef.current?.srcObject?.getVideoTracks?.() || [];
-    tracks.forEach((t) => (t.enabled = !t.enabled));
-    setVideoOff((v) => !v);
-  };
-
+  // --- ui helpers ---
   const copyInvite = async () => {
-    if (!room?.code) return;
-    const url = new URL(location.href);
-    url.searchParams.set("room", room.code);
-    if (room?.pin) url.searchParams.set("pin", room.pin);
-    await navigator.clipboard.writeText(url.toString());
-    addMsg({ sys: true, ts: Date.now(), text: "Invite link copied" });
+    if (!room) return;
+    const url = `${location.origin}?c=${room.code}`;
+    try { await navigator.clipboard.writeText(url); addMsg({ sys: true, ts: Date.now(), text: "Invite link copied" }); } catch {}
   };
 
-  // prefill URL
+  // deep-link join by code in URL (?c=123456)
   useEffect(() => {
-    const q = new URLSearchParams(location.search);
-    const code = q.get("room");
-    const p = q.get("pin");
+    const p = new URLSearchParams(location.search);
+    const code = p.get("c");
     if (code) setJoinCode(code);
-    if (p) setJoinPin(p);
   }, []);
 
-  // -------- UI --------
+  // render
   return (
     <div className="shell">
-      {/* Optional hidden audio players */}
-      <audio ref={ringInRef} src="/sounds/incoming.mp3" loop />
-      <audio ref={ringBackRef} src="/sounds/ringback.mp3" loop />
-
       <div className="glass">
         <header className="head">
-          <h1>H2N {isHost ? "Forum — Host" : "Forum"}</h1>
+          <h1>H2N Forum{isHost ? " — Host" : ""}</h1>
           <span className={`pill ${connected ? "ok" : ""}`}>{connected ? "Connected to server" : "Disconnected"}</span>
-
-          <button
-            className="chip"
-            onClick={() => {
-              setShowNameEdit((v) => !v);
-              setNameDraft(me);
-            }}
-          >
-            <span className="chip-label">You:</span> <b className="chip-name">{me}</b> <span className="chip-edit">✎</span>
-          </button>
-
-          {showNameEdit && (
-            <div className="name-pop">
-              <div className="name-row">
-                <input value={nameDraft} onChange={(e) => setNameDraft(e.target.value)} />
-              </div>
-              <div className="name-actions">
-                <button className="btn" onClick={() => setShowNameEdit(false)}>
-                  Cancel
-                </button>
-                <button
-                  className="btn primary"
-                  onClick={() => {
-                    setMe(nameDraft.trim() || "Me");
-                    setShowNameEdit(false);
-                  }}
-                >
-                  Save
-                </button>
-              </div>
-            </div>
-          )}
+          <div className="chip" title="Edit name" onClick={() => {
+            const v = prompt("Enter display name", me);
+            if (v && v.trim()) setMe(v.trim());
+          }}>
+            <span className="chip-label">You:</span>
+            <span className="chip-name">{me}</span>
+          </div>
         </header>
 
         {!room && (
           <>
             <div className="row title">Create a meeting</div>
             <div className="row">
-              <input placeholder="Room name (optional)" value={roomName} onChange={(e) => setRoomName(e.target.value)} />
-              <input placeholder="PIN (4–6 digits, optional)" value={pin} onChange={(e) => setPin(e.target.value)} />
-              <button className="btn primary" onClick={createRoom}>
-                Create Meeting
-              </button>
+              <label>Room name (optional)</label>
+              <input value={roomName} onChange={(e) => setRoomName(e.target.value)} placeholder="e.g. Team chat" />
+            </div>
+            <div className="row">
+              <label>PIN (4–6 digits, optional)</label>
+              <input value={pin} onChange={(e) => setPin(e.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="PIN (if required)" />
+            </div>
+            <div className="row">
+              <button className="btn primary" onClick={createRoom} disabled={!connected}>Create</button>
+              <span className="hint">Share the code after it’s created.</span>
             </div>
 
-            <div className="row title right">Code + optional PIN</div>
+            <div className="row title">Code + optional PIN</div>
             <div className="row">
-              <input placeholder="6-digit code" value={joinCode} onChange={(e) => setJoinCode(e.target.value)} />
-              <input placeholder="PIN (if required)" value={joinPin} onChange={(e) => setJoinPin(e.target.value)} />
-              <button className="btn" onClick={joinRoom}>
-                Join
-              </button>
+              <label>6-digit code</label>
+              <input value={joinCode} onChange={(e) => setJoinCode(e.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="6-digit code" />
+              <input value={joinPin} onChange={(e) => setJoinPin(e.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="PIN (if required)" />
+            </div>
+            <div className="row">
+              <button className="btn" onClick={joinRoom} disabled={!connected || joinCode.length !== 6}>Join</button>
             </div>
 
             <div className="hint">Rooms auto-delete after being empty for a while. Share the code (and PIN if set).</div>
@@ -396,134 +338,74 @@ export default function App() {
 
         {room && (
           <>
-            <div className="row">
-              <div className="inroom">
-                In room:&nbsp;<b>{room.name}</b>&nbsp;<span className="mono">({room.code})</span>
-                <button className="link" onClick={copyInvite}>
-                  Copy invite
-                </button>
-                <button className="link" onClick={leaveRoom}>
-                  Leave
-                </button>
-              </div>
+            <div className="row"><label>In room:</label><div><b>{room.name || "Room"}</b> ({room.code})</div>
+              <button className="btn" onClick={copyInvite}>Copy invite</button>
+              <button className="btn link" onClick={leaveRoom}>Leave</button>
             </div>
 
             <div className="row callbar">
-              {!isHost ? (
-                <>
-                  <label className="chk">
-                    <input type="checkbox" checked={voiceOnly} onChange={(e) => setVoiceOnly(e.target.checked)} />
-                    <span>Voice only</span>
-                  </label>
-
-                  <button className="btn primary" onClick={joinCallGuest} disabled={inCall}>
-                    Join call
-                  </button>
-                  <button className="btn" onClick={toggleMute} disabled={!inCall}>
-                    {muted ? "Unmute" : "Mute"}
-                  </button>
-                  <button className="btn" onClick={toggleVideo} disabled={!inCall || voiceOnly}>
-                    {videoOff ? "Camera On" : "Camera Off"}
-                  </button>
-                </>
-              ) : (
-                <>
-                  <button className="btn danger" onClick={endForAll} disabled={!room.live && !inCall}>
-                    End call for all
-                  </button>
-                  <button className="btn" onClick={toggleMute} disabled={!inCall}>
-                    {muted ? "Unmute" : "Mute"}
-                  </button>
-                  <button className="btn" onClick={toggleVideo} disabled={!inCall || voiceOnly}>
-                    {videoOff ? "Camera On" : "Camera Off"}
-                  </button>
-                  <button className="btn" onClick={toggleLock}>
-                    {room.locked ? "Unlock room" : "Lock room"}
-                  </button>
-                  {!room.live && !inCall && (
-                    <button className="btn primary" onClick={startCallHost} disabled={starting}>
-                      {starting ? "Starting…" : "Start call"}
-                    </button>
-                  )}
-                </>
+              {!inCall && isHost && (
+                <button className="btn primary" onClick={startCallHost} disabled={starting}>
+                  {starting ? "Starting…" : "Start call"}
+                </button>
               )}
+              {!isHost && (
+                <button className="btn primary" onClick={joinCallGuest} disabled={!room.live || inCall}>
+                  {room.live ? (joining ? "Requesting…" : "Join call") : "Waiting for host…"}
+                </button>
+              )}
+              <button className="btn" onClick={toggleMute} disabled={!inCall}>{muted ? "Unmute" : "Mute"}</button>
+              <button className="btn" onClick={toggleVideo} disabled={!inCall}>{videoOff ? "Camera On" : "Camera Off"}</button>
+              {isHost && <button className="btn" onClick={toggleLock}>{room.locked ? "Unlock room" : "Lock room"}</button>}
+              {isHost && <button className="btn danger" onClick={endForAll}>End call for all</button>}
+              {inCall && <button className="btn" onClick={leaveCall}>Leave call</button>}
+              <label className="chk"><input type="checkbox" checked={voiceOnly} onChange={(e) => setVoiceOnly(e.target.checked)} /> Voice only</label>
             </div>
 
-            {!voiceOnly && (
-              <div className="media single">
-                <div className="remotePane">
-                  <video
-                    ref={remoteRef}
-                    autoPlay
-                    playsInline
-                    className={mainVideo === "remote" ? (fitContain ? "fit" : "") : "pip"}
-                    onClick={() => setMainVideo("remote")}
-                    onDoubleClick={() => setFitContain((v) => !v)}
-                  />
-                  <video
-                    ref={localRef}
-                    autoPlay
-                    playsInline
-                    muted
-                    className={mainVideo === "local" ? (fitContain ? "fit" : "") : "pip"}
-                    onClick={() => setMainVideo("local")}
-                    onDoubleClick={() => setFitContain((v) => !v)}
-                  />
-                </div>
+            <div className="media single">
+              <div className="remotePane" onClick={swapVideos}>
+                <video ref={remoteRef} autoPlay playsInline muted={false} />
+                <video ref={localRef} autoPlay playsInline muted className="pip" />
               </div>
-            )}
+            </div>
           </>
         )}
 
-        {/* messages */}
         <div className="msgs" ref={msgsRef}>
-          {msgs.length === 0 ? (
-            <div className="muted">No messages yet. Say hi! 👋</div>
-          ) : (
-            msgs.map((m, i) => (
-              <div key={i} className={`bubble ${m.sys ? "sys" : ""}`}>
-                {!m.sys && (
-                  <div className="meta">
-                    <span className="who">{m.name}</span>
-                    <span className="ts">{typeof m.ts === "number" ? new Date(m.ts).toLocaleTimeString() : ""}</span>
-                  </div>
-                )}
-                <div className="text">{m.text}</div>
-              </div>
-            ))
-          )}
+          {msgs.map((m, i) => (
+            <div key={i} className={`bubble ${m.sys ? "sys" : ""}`}>
+              {!m.sys && <div className="meta"><span className="who">{m.name}</span><span className="ts">{new Date(m.ts).toLocaleTimeString()}</span></div>}
+              <div>{m.text}</div>
+            </div>
+          ))}
         </div>
 
-        <div className="send">
-          <textarea
-            placeholder="Type a message… (Enter to send, Shift+Enter for new line)"
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                const t = e.currentTarget.value.trim();
-                if (t) {
-                  addMsg({ name: me, ts: Date.now(), text: t });
-                  socketRef.current?.emit("chat", t);
-                  e.currentTarget.value = "";
-                }
-              }
-            }}
-          />
-          <button
-            className="btn primary"
-            onClick={() => {
-              const el = document.querySelector(".send textarea");
-              const t = el.value.trim();
-              if (!t) return;
-              addMsg({ name: me, ts: Date.now(), text: t });
-              socketRef.current?.emit("chat", t);
-              el.value = "";
-            }}
-          >
-            Send
-          </button>
-        </div>
+        <SendBox disabled={!room} onSend={(text) => socketRef.current?.emit("chat", text)} />
       </div>
+    </div>
+  );
+}
+
+function SendBox({ disabled, onSend }) {
+  const [text, setText] = useState("");
+  const send = () => {
+    const t = text.trim();
+    if (!t) return;
+    onSend(t);
+    setText("");
+  };
+  return (
+    <div className="send">
+      <textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder="Type a message… (Enter to send, Shift+Enter for new line)"
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+        }}
+        disabled={disabled}
+      />
+      <button className="btn primary" onClick={send} disabled={disabled}>Send</button>
     </div>
   );
 }
