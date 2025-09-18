@@ -2,6 +2,7 @@
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
+import crypto from "crypto";
 
 // ---------- config ----------
 const PORT = process.env.PORT || 3001;
@@ -30,41 +31,38 @@ const io = new Server(server, {
 // ---------- in-memory room store ----------
 /**
  * rooms: Map<code, {
- *   code: string,
- *   name: string,
- *   pin?: string,
- *   hostId: string,
- *   locked: boolean,
- *   live: boolean,           // whether a call is active
+ *   code, name, pin?, hostId, hostToken, locked, live
  * }>
  */
 const rooms = new Map();
 const randCode = () => String(Math.floor(100000 + Math.random() * 900000));
+const randToken = () => crypto.randomBytes(16).toString("hex");
 
 // ---------- socket ----------
 io.on("connection", (socket) => {
   socket.data.name = "Guest";
   socket.data.roomCode = null;
 
-  socket.on("hello", (name) => {
-    socket.data.name = String(name || "Guest").slice(0, 40);
-  });
+  socket.on("hello", (name) => (socket.data.name = String(name || "Guest").slice(0, 40)));
 
   // ----- rooms -----
   socket.on("create-room", ({ name, pin }, cb) => {
     const code = randCode();
+    const token = randToken();
     const room = {
       code,
       name: String(name || "Room").slice(0, 60),
       pin: pin ? String(pin).trim() : undefined,
       hostId: socket.id,
+      hostToken: token,
       locked: false,
       live: false,
     };
     rooms.set(code, room);
     socket.data.roomCode = code;
     socket.join(code);
-    cb?.({ ok: true, room });
+    // Return token ONLY to creator
+    cb?.({ ok: true, room, hostToken: token });
     io.to(code).emit("chat", { sys: true, ts: Date.now(), text: `Created room: ${room.name} (${room.code})` });
   });
 
@@ -90,19 +88,28 @@ io.on("connection", (socket) => {
     sock.leave(rid);
     sock.data.roomCode = null;
 
-    // if host leaves, announce and (optionally) end call
     const room = rooms.get(rid);
     if (room && room.hostId === sock.id) {
       io.to(rid).emit("chat", { sys: true, ts: Date.now(), text: "Host ended the call" });
       io.to(rid).emit("end-call");
       room.live = false;
-      // if room empties out, delete after a bit
       setTimeout(async () => {
         const left = await io.in(rid).fetchSockets();
         if (left.length === 0) rooms.delete(rid);
       }, 30000);
     }
   }
+
+  // ----- host (re)claim with token -----
+  socket.on("claim-host", ({ code, token }, cb) => {
+    const room = rooms.get(String(code || "").trim());
+    if (!room) return cb?.({ ok: false, error: "room not found" });
+    if (room.hostToken !== String(token || "")) return cb?.({ ok: false, error: "bad token" });
+    room.hostId = socket.id; // transfer host to this socket
+    socket.data.roomCode = room.code;
+    socket.join(room.code);
+    cb?.({ ok: true, room });
+  });
 
   // ----- text chat -----
   socket.on("chat", (text) => {
@@ -145,33 +152,25 @@ io.on("connection", (socket) => {
   });
 
   // ----- WebRTC signalling -----
-  // broadcast (host -> all, initial ring)
   socket.on("rtc:offer", ({ offer }, cb) => {
     const rid = socket.data.roomCode;
-    if (!rid) return cb?.({ ok: false });
     const room = rooms.get(rid);
-    if (!room || room.hostId !== socket.id) return cb?.({ ok: false });
-
+    if (!rid || !room || room.hostId !== socket.id) return cb?.({ ok: false });
     io.to(rid).except(socket.id).emit("rtc:offer", { offer });
     cb?.({ ok: true });
   });
 
   socket.on("rtc:answer", ({ answer }) => {
     const rid = socket.data.roomCode;
-    if (!rid) return;
-    // answers from guests go only to host
     const room = rooms.get(rid);
-    if (!room) return;
+    if (!rid || !room) return;
     io.to(room.hostId).emit("rtc:answer", { answer, from: socket.id });
   });
 
   socket.on("rtc:ice", ({ candidate }) => {
     const rid = socket.data.roomCode;
-    if (!rid || !candidate) return;
     const room = rooms.get(rid);
-    if (!room) return;
-
-    // If host -> broadcast to others; if guest -> to host
+    if (!rid || !room || !candidate) return;
     if (socket.id === room.hostId) {
       socket.to(rid).emit("rtc:ice", { candidate, from: socket.id });
     } else {
@@ -179,10 +178,9 @@ io.on("connection", (socket) => {
     }
   });
 
-  // ---- targeted (needed when a guest joins late) ----
   socket.on("rtc:need-offer", () => {
-    const code = socket.data.roomCode;
-    const room = rooms.get(code);
+    const rid = socket.data.roomCode;
+    const room = rooms.get(rid);
     if (!room) return;
     io.to(room.hostId).emit("rtc:need-offer", { peerId: socket.id });
   });
@@ -203,7 +201,6 @@ io.on("connection", (socket) => {
   });
 });
 
-// ---------- start ----------
 server.listen(PORT, () => {
   console.log(`H2N Forum server on :${PORT}`);
   console.log(`Allowed CORS origins: ${allowed.join(", ") || "(none)"}`);
