@@ -3,11 +3,24 @@ import { useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import "./App.css";
 
-// Render/Vercel env — set VITE_SERVER_URL in your frontend .env
+// Set this in Vercel env: VITE_SERVER_URL=https://<your-render-app>.onrender.com
 const SERVER_URL = (import.meta.env.VITE_SERVER_URL || "").split(",")[0].trim();
 
-// WebRTC constraints
-const ICE = { iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }] };
+// ICE: keeps STUN; later we can add TURN via env without changing code
+const TURN_URLS = (import.meta.env.VITE_TURN_URLS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+const TURN_USER = import.meta.env.VITE_TURN_USERNAME || "";
+const TURN_PASS = import.meta.env.VITE_TURN_PASSWORD || "";
+
+const ICE = {
+  iceServers: [
+    { urls: ["stun:stun.l.google.com:19302"] },
+    ...(TURN_URLS.length ? [{ urls: TURN_URLS, username: TURN_USER, credential: TURN_PASS }] : []),
+  ],
+};
+
 const AUDIO_ONLY = {
   audio: { echoCancellation: true, noiseSuppression: true },
   video: false,
@@ -23,23 +36,24 @@ const LOW_VIDEO = {
 };
 
 export default function App() {
-  // socket / rtc refs
+  // socket / rtc
   const socketRef = useRef(null);
-  const pcRef = useRef(null);
+  const pcRef = useRef(null);         // single peer (host<->guest)
+  const remotePeerIdRef = useRef(null);
 
   // media elements
   const localRef = useRef(null);
   const remoteRef = useRef(null);
 
-  // connection + identity
+  // identity / connection
   const [connected, setConnected] = useState(false);
   const [socketId, setSocketId] = useState(null);
   const [me, setMe] = useState(() => localStorage.getItem("me") || "Me");
 
-  // room state (server returns: { code, name, hostId, locked, live })
+  // room state (server returns { code, name, pin?, hostId })
   const [room, setRoom] = useState(null);
   const [roomName, setRoomName] = useState("");
-  const [pin, setPin] = useState(""); // optional (only needed when creating/locked)
+  const [pin, setPin] = useState("");
   const [joinCode, setJoinCode] = useState("");
   const [joinPin, setJoinPin] = useState("");
 
@@ -50,7 +64,7 @@ export default function App() {
   const [muted, setMuted] = useState(false);
   const [videoOff, setVideoOff] = useState(false);
 
-  // chat (lightweight)
+  // chat
   const [msgs, setMsgs] = useState([]);
   const [text, setText] = useState("");
   const msgsRef = useRef(null);
@@ -72,52 +86,60 @@ export default function App() {
     s.on("disconnect", () => setConnected(false));
     s.io.on("reconnect", () => setSocketId(s.id));
 
-    // room updates
-    s.on("room:live", (live) => setRoom((r) => (r ? { ...r, live } : r)));
-    s.on("room:locked", (locked) => setRoom((r) => (r ? { ...r, locked } : r)));
-
     // chat
     s.on("chat", (m) => addMsg(m));
 
-    // signaling
-    s.on("rtc:offer", async ({ offer }) => {
-      // Guest receives host offer (or peer receives your offer). Join it.
-      if (pcRef.current) return; // already in a call
-      const kind = voiceOnly ? "audio" : "video";
-      const pc = setupPC();
-      const ms = await getStream(kind);
-      ms.getTracks().forEach((t) => pc.addTrack(t, ms));
+    // ---- targeted signaling (matches your server.js) ----
 
-      await pc.setRemoteDescription(offer);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      s.emit("rtc:answer", { answer });
-      setInCall(true);
-    });
-
-    s.on("rtc:answer", async ({ answer }) => {
+    // Host receives request to make an offer for a specific peer
+    s.on("rtc:make-offer", async ({ to }) => {
+      if (!room || !isHost) return;
       try {
-        await pcRef.current?.setRemoteDescription(answer);
+        await hostMakeOfferForPeer(to);
       } catch {}
     });
 
-    s.on("rtc:ice", async ({ candidate }) => {
-      if (candidate) {
-        try {
-          await pcRef.current?.addIceCandidate(candidate);
-        } catch {}
+    // Peer receives an offer (from host, targeted)
+    s.on("rtc:offer", async ({ from, offer }) => {
+      remotePeerIdRef.current = from;
+      const pc = await ensurePC();
+      // Ensure local tracks attached before answering
+      const kind = voiceOnly ? "audio" : "video";
+      const c = kind === "audio" ? AUDIO_ONLY : LOW_VIDEO;
+      const haveLocal = localRef.current?.srcObject;
+      if (!haveLocal) {
+        const ms = await navigator.mediaDevices.getUserMedia(c);
+        localRef.current.srcObject = ms;
+        ms.getTracks().forEach((t) => pc.addTrack(t, ms));
       }
+      await pc.setRemoteDescription(offer);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socketRef.current?.emit("rtc:answer-to", { to: from, answer });
+      setInCall(true);
     });
 
-    // host ended the call for everyone
-    s.on("end-call", () => {
-      leaveCall();
-      addMsg({ sys: true, ts: Date.now(), text: "Host ended the call" });
+    // Peer receives an answer to a previously sent offer
+    s.on("rtc:answer", async ({ from, answer }) => {
+      remotePeerIdRef.current = from;
+      try {
+        await pcRef.current?.setRemoteDescription(answer);
+        setInCall(true);
+      } catch {}
+    });
+
+    // Room-wide ICE (server relays with {from,candidate})
+    s.on("rtc:ice", async ({ from, candidate }) => {
+      if (!candidate) return;
+      try {
+        await pcRef.current?.addIceCandidate(candidate);
+        remotePeerIdRef.current = from;
+      } catch {}
     });
 
     return () => s.disconnect();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [isHost, voiceOnly, me]);
 
   // persist name + re-hello
   useEffect(() => {
@@ -125,7 +147,7 @@ export default function App() {
     socketRef.current?.emit("hello", me);
   }, [me]);
 
-  // prefill join via URL (?room=xxxxxx&pin=1234)
+  // prefill join via URL
   useEffect(() => {
     const q = new URLSearchParams(location.search);
     const code = q.get("room");
@@ -143,7 +165,8 @@ export default function App() {
   }, [msgs]);
 
   // ---------- helpers ----------
-  const setupPC = () => {
+  async function ensurePC() {
+    if (pcRef.current) return pcRef.current;
     const pc = new RTCPeerConnection(ICE);
     pcRef.current = pc;
 
@@ -161,14 +184,29 @@ export default function App() {
       }
     };
     return pc;
-  };
+  }
 
-  const getStream = async (kind) => {
+  async function attachLocal(kind) {
     const c = kind === "audio" ? AUDIO_ONLY : LOW_VIDEO;
     const ms = await navigator.mediaDevices.getUserMedia(c);
-    if (localRef.current) localRef.current.srcObject = ms;
-    return ms;
-  };
+    localRef.current.srcObject = ms;
+    const pc = await ensurePC();
+    ms.getTracks().forEach((t) => pc.addTrack(t, ms));
+    return pc;
+  }
+
+  // Host: make targeted offer to a peerId
+  async function hostMakeOfferForPeer(peerId) {
+    const kind = voiceOnly ? "audio" : "video";
+    const haveLocal = localRef.current?.srcObject;
+    const pc = haveLocal ? await ensurePC() : await attachLocal(kind);
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    socketRef.current?.emit("rtc:offer-to", { to: peerId, offer });
+    remotePeerIdRef.current = peerId;
+    setInCall(true);
+  }
 
   // ---------- rooms ----------
   const createRoom = () => {
@@ -211,57 +249,39 @@ export default function App() {
     addMsg({ sys: true, ts: Date.now(), text: "Left room" });
   };
 
-  // ---------- host controls ----------
-  const toggleLock = () => {
-    if (!isHost) return;
-    socketRef.current?.emit("room:lock", !room.locked, (res) => {
-      if (res?.ok) setRoom((r) => ({ ...r, locked: res.locked }));
-    });
-  };
-
+  // ---------- call actions ----------
   const startCallHost = async () => {
-    if (!isHost || inCall || !room) return;
+    if (!isHost || inCall) return;
     setStarting(true);
     try {
-      // let server mark room "live" so guests can Join
-      await new Promise((resolve) => {
-        socketRef.current?.emit("room:live", true, () => resolve());
-      });
-
-      const kind = voiceOnly ? "audio" : "video";
-      const pc = setupPC();
-      const ms = await getStream(kind);
-      ms.getTracks().forEach((t) => pc.addTrack(t, ms));
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socketRef.current?.emit("rtc:offer", { offer });
-
-      setInCall(true);
+      // Host waits for guests to press Join (which triggers rtc:make-offer).
+      // For now we just prime local media so we're ready.
+      await attachLocal(voiceOnly ? "audio" : "video");
+      setInCall(true); // host is "in call" and ready to offer when asked
+      addMsg({ sys: true, ts: Date.now(), text: "Call is live. Guests can tap Join." });
     } catch {}
     setStarting(false);
   };
 
-  const endForAll = () => {
-    if (!isHost || !room) return;
-    socketRef.current?.emit("end-for-all", () => {});
-    leaveCall();
-  };
-
-  // ---------- guest join UX ----------
   const joinCallGuest = async () => {
-    // Guests wait for host offer. This primes permission so the answer can be created quickly.
-    if (inCall) return;
+    if (!room || inCall) return;
+    // Ask host to make an offer targeted to me (late-join safe)
+    socketRef.current?.emit("rtc:need-offer", { roomId: room.code });
+    // Prime permissions while waiting
     try {
       const kind = voiceOnly ? "audio" : "video";
-      const ms = await navigator.mediaDevices.getUserMedia(
-        kind === "audio" ? AUDIO_ONLY : LOW_VIDEO
-      );
+      const c = kind === "audio" ? AUDIO_ONLY : LOW_VIDEO;
+      const ms = await navigator.mediaDevices.getUserMedia(c);
       ms.getTracks().forEach((t) => t.stop());
     } catch {}
   };
 
-  // ---------- call common ----------
+  const endForAllLocal = () => {
+    // For now (mesh 1:1) guest just leaves; host can refresh to fully reset.
+    leaveCall();
+    addMsg({ sys: true, ts: Date.now(), text: "You left the call" });
+  };
+
   const leaveCall = () => {
     setInCall(false);
     setStarting(false);
@@ -284,6 +304,7 @@ export default function App() {
       localRef.current.srcObject = null;
     }
     if (remoteRef.current?.srcObject) remoteRef.current.srcObject = null;
+    remotePeerIdRef.current = null;
   };
 
   const toggleMute = () => {
@@ -291,6 +312,7 @@ export default function App() {
     tracks.forEach((t) => (t.enabled = !t.enabled));
     setMuted((v) => !v);
   };
+
   const toggleVideo = () => {
     const tracks = localRef.current?.srcObject?.getVideoTracks?.() || [];
     tracks.forEach((t) => (t.enabled = !t.enabled));
@@ -312,7 +334,7 @@ export default function App() {
     if (!room?.code) return;
     const url = new URL(location.href);
     url.searchParams.set("room", room.code);
-    if (room.locked && pin) url.searchParams.set("pin", pin);
+    if (room?.pin) url.searchParams.set("pin", room.pin);
     await navigator.clipboard.writeText(url.toString());
     addMsg({ sys: true, ts: Date.now(), text: "Invite link copied" });
   };
@@ -395,7 +417,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Host vs Guest control bar */}
             <div className="row callbar">
               <label className="chk">
                 <input
@@ -421,19 +442,13 @@ export default function App() {
                   <button className="btn" onClick={toggleVideo} disabled={!inCall || voiceOnly}>
                     {videoOff ? "Camera On" : "Camera Off"}
                   </button>
-                  <button className="btn" onClick={toggleLock}>
-                    {room.locked ? "Unlock room" : "Lock room"}
-                  </button>
-                  <button className="btn danger" onClick={endForAll} disabled={!inCall}>
-                    End call for all
-                  </button>
                 </>
               ) : (
                 <>
                   <button
                     className="btn primary"
                     onClick={joinCallGuest}
-                    disabled={inCall || !room.live}
+                    disabled={inCall}
                   >
                     Join call
                   </button>
@@ -445,16 +460,12 @@ export default function App() {
                   </button>
                 </>
               )}
+
+              <button className="btn danger" onClick={endForAllLocal} disabled={!inCall}>
+                Leave call
+              </button>
             </div>
 
-            {!room.live && !isHost && (
-              <div className="hint">
-                Waiting for the host to start the call. You’ll be able to <b>Join call</b> once it
-                starts.
-              </div>
-            )}
-
-            {/* Media area */}
             {!voiceOnly && (
               <div className="media single">
                 <div className="remotePane">
@@ -466,7 +477,6 @@ export default function App() {
           </>
         )}
 
-        {/* Messages */}
         <div className="msgs" ref={msgsRef}>
           {msgs.length === 0 ? (
             <div className="muted">No messages yet. Say hi! 👋</div>
