@@ -1,207 +1,208 @@
 // server.js
+// Minimal Socket.IO signaling server with rooms, host role, lock, and "live" (start call)
+// Works with your current App.jsx
+
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
-import crypto from "crypto";
+import cors from "cors";
 
-// ---------- config ----------
 const PORT = process.env.PORT || 3001;
-const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || ""; // e.g. https://h2nforum.vercel.app
-const allowed = (CLIENT_ORIGIN || "")
+const ALLOW = (process.env.CORS_ALLOW || "")
   .split(",")
-  .map((s) => s.trim())
+  .map(s => s.trim())
   .filter(Boolean);
 
-// ---------- http + ws ----------
 const app = express();
+app.use(cors({
+  origin: (origin, cb) => cb(null, true), // keep simple; front-end does its own domain
+  credentials: true
+}));
+
 const server = http.createServer(app);
 const io = new Server(server, {
-  transports: ["websocket"],
-  cors: {
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      if (allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
-      return cb(new Error("CORS blocked"), false);
-    },
-    methods: ["GET", "POST"],
-    credentials: true,
-  },
+  cors: { origin: "*", methods: ["GET","POST"] }
 });
 
-// ---------- in-memory room store ----------
-/**
- * rooms: Map<code, {
- *   code, name, pin?, hostId, hostToken, locked, live
- * }>
- */
+// Rooms map:
+// code => { code, name, pin?, hostId, locked:false, live:false, lastActive: Date.now(), members:Set<socketId> }
 const rooms = new Map();
-const randCode = () => String(Math.floor(100000 + Math.random() * 900000));
-const randToken = () => crypto.randomBytes(16).toString("hex");
 
-// ---------- socket ----------
+function randCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function now() { return Date.now(); }
+
+function getRoomOf(socket) {
+  const rcode = socket.data.roomCode;
+  return rcode ? rooms.get(rcode) : null;
+}
+
+function sys(roomCode, text) {
+  io.to(roomCode).emit("chat", { sys: true, ts: now(), text });
+}
+
 io.on("connection", (socket) => {
   socket.data.name = "Guest";
-  socket.data.roomCode = null;
+  socket.emit("chat", { sys:true, ts: now(), text: "Connected to server" });
 
-  socket.on("hello", (name) => (socket.data.name = String(name || "Guest").slice(0, 40)));
+  socket.on("hello", (name) => {
+    if (typeof name === "string" && name.trim()) socket.data.name = name.trim();
+  });
 
-  // ----- rooms -----
+  // Create room (becomes host)
   socket.on("create-room", ({ name, pin }, cb) => {
-    const code = randCode();
-    const token = randToken();
-    const room = {
-      code,
-      name: String(name || "Room").slice(0, 60),
-      pin: pin ? String(pin).trim() : undefined,
-      hostId: socket.id,
-      hostToken: token,
-      locked: false,
-      live: false,
-    };
-    rooms.set(code, room);
-    socket.data.roomCode = code;
-    socket.join(code);
-    // Return token ONLY to creator
-    cb?.({ ok: true, room, hostToken: token });
-    io.to(code).emit("chat", { sys: true, ts: Date.now(), text: `Created room: ${room.name} (${room.code})` });
-  });
+    try {
+      const code = randCode();
+      const room = {
+        code,
+        name: (name && String(name).trim()) || "Room",
+        pin: (pin && String(pin).trim()) || null,
+        hostId: socket.id,
+        locked: false,
+        live: false,
+        lastActive: now(),
+        members: new Set()
+      };
+      rooms.set(code, room);
 
-  socket.on("join-room", ({ code, pin }, cb) => {
-    const rid = String(code || "").trim();
-    const room = rooms.get(rid);
-    if (!room) return cb?.({ ok: false, error: "room not found" });
-    if (room.locked) return cb?.({ ok: false, error: "room is locked" });
-    if (room.pin && room.pin !== String(pin || "").trim()) return cb?.({ ok: false, error: "wrong pin" });
+      // join the socket into that room
+      socket.join(code);
+      socket.data.roomCode = code;
+      room.members.add(socket.id);
 
-    socket.join(rid);
-    socket.data.roomCode = rid;
-    cb?.({ ok: true, room });
-    io.to(rid).emit("chat", { sys: true, ts: Date.now(), text: `${socket.data.name} joined` });
-  });
-
-  socket.on("leave-room", () => leaveRoom(socket));
-  socket.on("disconnect", () => leaveRoom(socket));
-
-  function leaveRoom(sock) {
-    const rid = sock.data.roomCode;
-    if (!rid) return;
-    sock.leave(rid);
-    sock.data.roomCode = null;
-
-    const room = rooms.get(rid);
-    if (room && room.hostId === sock.id) {
-      io.to(rid).emit("chat", { sys: true, ts: Date.now(), text: "Host ended the call" });
-      io.to(rid).emit("end-call");
-      room.live = false;
-      setTimeout(async () => {
-        const left = await io.in(rid).fetchSockets();
-        if (left.length === 0) rooms.delete(rid);
-      }, 30000);
+      cb?.({ ok: true, room: { code, name: room.name, hostId: room.hostId, locked: room.locked, live: room.live } });
+      sys(code, `Created room: ${room.name} (${code})`);
+    } catch (e) {
+      cb?.({ ok: false, error: "create-failed" });
     }
-  }
-
-  // ----- host (re)claim with token -----
-  socket.on("claim-host", ({ code, token }, cb) => {
-    const room = rooms.get(String(code || "").trim());
-    if (!room) return cb?.({ ok: false, error: "room not found" });
-    if (room.hostToken !== String(token || "")) return cb?.({ ok: false, error: "bad token" });
-    room.hostId = socket.id; // transfer host to this socket
-    socket.data.roomCode = room.code;
-    socket.join(room.code);
-    cb?.({ ok: true, room });
   });
 
-  // ----- text chat -----
-  socket.on("chat", (text) => {
-    const rid = socket.data.roomCode;
-    if (!rid) return;
-    const msg =
-      typeof text === "string"
-        ? { name: socket.data.name, text: text, ts: Date.now() }
-        : { name: socket.data.name, text: String(text?.text || ""), ts: text?.ts || Date.now() };
-    io.to(rid).emit("chat", msg);
+  // Join room
+  socket.on("join-room", ({ code, pin }, cb) => {
+    const r = rooms.get(String(code || "").trim());
+    if (!r) return cb?.({ ok:false, error:"room-not-found" });
+    if (r.locked) return cb?.({ ok:false, error:"locked" });
+    if (r.pin && String(pin || "").trim() !== r.pin) return cb?.({ ok:false, error:"bad-pin" });
+
+    socket.join(r.code);
+    socket.data.roomCode = r.code;
+    r.members.add(socket.id);
+    r.lastActive = now();
+
+    cb?.({ ok:true, room: { code:r.code, name:r.name, hostId:r.hostId, locked:r.locked, live:r.live }});
+    sys(r.code, `${socket.data.name} joined`);
   });
 
-  // ----- host controls -----
-  socket.on("room:lock", (locked, cb) => {
-    const rid = socket.data.roomCode;
-    const room = rooms.get(rid);
-    if (!room || room.hostId !== socket.id) return cb?.({ ok: false });
-    room.locked = !!locked;
-    io.to(rid).emit("room:locked", room.locked);
-    cb?.({ ok: true, locked: room.locked });
+  // Leave room
+  socket.on("leave-room", () => {
+    const r = getRoomOf(socket);
+    if (!r) return;
+    socket.leave(r.code);
+    r.members.delete(socket.id);
+    socket.data.roomCode = null;
+    sys(r.code, `${socket.data.name} left room`);
+    cleanup(r.code);
   });
 
+  // Host toggles live (start/stop call gate)
   socket.on("room:live", (live, cb) => {
-    const rid = socket.data.roomCode;
-    const room = rooms.get(rid);
-    if (!room || room.hostId !== socket.id) return cb?.({ ok: false });
-    room.live = !!live;
-    io.to(rid).emit("room:live", room.live);
-    cb?.({ ok: true, live: room.live });
+    const r = getRoomOf(socket);
+    if (!r) return cb?.({ ok:false });
+    if (r.hostId !== socket.id) return cb?.({ ok:false });
+    r.live = !!live;
+    r.lastActive = now();
+    io.to(r.code).emit("room:live", r.live);
+    cb?.({ ok:true, live:r.live });
   });
 
+  // Host lock/unlock room
+  socket.on("room:lock", (lock, cb) => {
+    const r = getRoomOf(socket);
+    if (!r) return cb?.({ ok:false });
+    if (r.hostId !== socket.id) return cb?.({ ok:false });
+    r.locked = !!lock;
+    r.lastActive = now();
+    io.to(r.code).emit("room:locked", r.locked);
+    cb?.({ ok:true, locked:r.locked });
+  });
+
+  // End call for all (host only)
   socket.on("end-for-all", (cb) => {
-    const rid = socket.data.roomCode;
-    const room = rooms.get(rid);
-    if (!room || room.hostId !== socket.id) return cb?.({ ok: false });
-    room.live = false;
-    io.to(rid).emit("end-call");
-    io.to(rid).emit("chat", { sys: true, ts: Date.now(), text: "Host ended the call" });
-    cb?.({ ok: true });
+    const r = getRoomOf(socket);
+    if (!r) return cb?.({ ok:false });
+    if (r.hostId !== socket.id) return cb?.({ ok:false });
+    io.to(r.code).emit("end-call");
+    r.live = false;
+    io.to(r.code).emit("room:live", false);
+    sys(r.code, "Host ended the call");
+    cb?.({ ok:true });
   });
 
-  // ----- WebRTC signalling -----
-  socket.on("rtc:offer", ({ offer }, cb) => {
-    const rid = socket.data.roomCode;
-    const room = rooms.get(rid);
-    if (!rid || !room || room.hostId !== socket.id) return cb?.({ ok: false });
-    io.to(rid).except(socket.id).emit("rtc:offer", { offer });
-    cb?.({ ok: true });
+  // Chat (optional)
+  socket.on("chat", (payload) => {
+    const r = getRoomOf(socket);
+    if (!r) return;
+    const msg = typeof payload === "string"
+      ? { name: socket.data.name, text: payload, ts: now() }
+      : { name: socket.data.name, ...(payload || {}), ts: now() };
+    io.to(r.code).emit("chat", msg);
+  });
+
+  // --- WebRTC signaling passthrough ---
+  socket.on("rtc:offer", ({ offer }) => {
+    const r = getRoomOf(socket);
+    if (!r) return;
+    // host sends offer to everyone else
+    socket.to(r.code).emit("rtc:offer", { offer, from: socket.id });
   });
 
   socket.on("rtc:answer", ({ answer }) => {
-    const rid = socket.data.roomCode;
-    const room = rooms.get(rid);
-    if (!rid || !room) return;
-    io.to(room.hostId).emit("rtc:answer", { answer, from: socket.id });
+    const r = getRoomOf(socket);
+    if (!r) return;
+    // guest answers — send to everyone (host listens and sets remote desc)
+    socket.to(r.code).emit("rtc:answer", { answer, from: socket.id });
   });
 
   socket.on("rtc:ice", ({ candidate }) => {
-    const rid = socket.data.roomCode;
-    const room = rooms.get(rid);
-    if (!rid || !room || !candidate) return;
-    if (socket.id === room.hostId) {
-      socket.to(rid).emit("rtc:ice", { candidate, from: socket.id });
+    const r = getRoomOf(socket);
+    if (!r) return;
+    socket.to(r.code).emit("rtc:ice", { candidate, from: socket.id });
+  });
+
+  // Disconnect
+  socket.on("disconnect", () => {
+    const r = getRoomOf(socket);
+    if (!r) return;
+    r.members.delete(socket.id);
+    if (r.hostId === socket.id) {
+      // if host vanishes, end call and unlock live
+      io.to(r.code).emit("end-call");
+      r.live = false;
+      io.to(r.code).emit("room:live", false);
+      sys(r.code, "Host disconnected");
+      // pick a new host if members remain
+      const [newHost] = r.members;
+      r.hostId = newHost || null;
     } else {
-      io.to(room.hostId).emit("rtc:ice", { candidate, from: socket.id });
+      sys(r.code, `${socket.data.name} left`);
     }
-  });
-
-  socket.on("rtc:need-offer", () => {
-    const rid = socket.data.roomCode;
-    const room = rooms.get(rid);
-    if (!room) return;
-    io.to(room.hostId).emit("rtc:need-offer", { peerId: socket.id });
-  });
-
-  socket.on("rtc:offer-to", ({ offer, targetId }) => {
-    if (!targetId) return;
-    io.to(targetId).emit("rtc:offer-to", { from: socket.id, offer });
-  });
-
-  socket.on("rtc:answer-to", ({ answer, targetId }) => {
-    if (!targetId) return;
-    io.to(targetId).emit("rtc:answer-to", { from: socket.id, answer });
-  });
-
-  socket.on("rtc:ice-to", ({ candidate, targetId }) => {
-    if (!targetId || !candidate) return;
-    io.to(targetId).emit("rtc:ice-to", { from: socket.id, candidate });
+    cleanup(r.code);
   });
 });
 
+function cleanup(code) {
+  const r = rooms.get(code);
+  if (!r) return;
+  if (r.members.size === 0) {
+    // auto-delete after idle; simple immediate cleanup for now
+    rooms.delete(code);
+  }
+}
+
+app.get("/", (_req, res) => res.send("H2N Forum signaling is running"));
 server.listen(PORT, () => {
   console.log(`H2N Forum server on :${PORT}`);
-  console.log(`Allowed CORS origins: ${allowed.join(", ") || "(none)"}`);
+  console.log("Allowed CORS origins:", ALLOW.length ? ALLOW.join(", ") : "(none)");
 });
