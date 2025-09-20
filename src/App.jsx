@@ -4,7 +4,7 @@ import { io } from "socket.io-client";
 import "./App.css";
 
 const SERVER_URL = (import.meta.env.VITE_SERVER_URL || "").split(",")[0].trim();
-const TURN_URL   = (import.meta.env.VITE_TURN_URL   || "").trim();
+const TURN_URL = (import.meta.env.VITE_TURN_URL || "").trim();
 
 const AUDIO_ONLY = { audio: { echoCancellation: true, noiseSuppression: true }, video: false };
 const LOW_VIDEO = {
@@ -12,22 +12,16 @@ const LOW_VIDEO = {
   video: { width: { ideal: 640, max: 640 }, height: { ideal: 360, max: 360 }, frameRate: { max: 15 }, facingMode: "user" },
 };
 
-// ---- TURN / ICE fetch (robust to array OR { iceServers }) ----
 async function getIceServers() {
   try {
     if (!TURN_URL) throw new Error("TURN_URL missing");
-    const res = await fetch(TURN_URL, { cache: "no-store" });
-    if (!res.ok) throw new Error(`TURN fetch failed: ${res.status}`);
-    const data = await res.json();
-
-    // Metered commonly returns { iceServers: [...] }. Some providers return an array directly.
-    const list = Array.isArray(data) ? data : data?.iceServers;
-    if (!Array.isArray(list) || list.length === 0) {
-      throw new Error("Empty TURN list");
-    }
-    return list;
+    const res = await fetch(TURN_URL);
+    if (!res.ok) throw new Error(`TURN fetch ${res.status}`);
+    const arr = await res.json();
+    if (!Array.isArray(arr) || arr.length === 0) throw new Error("Empty TURN list");
+    return arr;
   } catch (err) {
-    console.warn("TURN fetch failed, falling back to STUN:", err?.message || err);
+    console.warn("TURN fetch failed, fallback to STUN:", err?.message || err);
     return [{ urls: ["stun:stun.l.google.com:19302"] }];
   }
 }
