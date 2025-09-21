@@ -83,19 +83,27 @@ export default function App() {
 });
     s.on("room:locked", (locked) => setRoom((r) => (r ? { ...r, locked } : r)));
 
-    s.on("rtc:offer", async ({ offer }) => {
-      if (pcRef.current) return;
-      iceRef.current = await getIceServers();
-      const pc = await setupPeer();
-      const ms = await getLocalStream();
-      ms.getTracks().forEach((t) => pc.addTrack(t, ms));
+    // Host: when a guest is ready, start an offer to that specific guest
+s.on("rtc:ready", ({ guestId }) => {
+  if (!isHost || !guestId) return;
+  startCallHost(guestId);   // pass the peer id
+});
 
-      await pc.setRemoteDescription(offer);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      s.emit("rtc:answer", { answer });
-      setInCall(true);
-    });
+    s.on("rtc:offer", async ({ offer, from }) => {
+  if (pcRef.current) return;
+  iceRef.current = await getIceServers();
+  const pc = await setupPeer();
+  const ms = await getLocalStream();
+  ms.getTracks().forEach((t) => pc.addTrack(t, ms));
+
+  await pc.setRemoteDescription(offer);
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+
+  // Answer back to the host that sent the offer
+  socketRef.current?.emit("rtc:answer", { to: from, answer });
+  setInCall(true);
+});
 
     s.on("rtc:answer", async ({ answer }) => {
       if (!pcRef.current) return;
@@ -182,28 +190,29 @@ export default function App() {
       if (res?.ok) setRoom((r) => ({ ...r, locked: res.locked }));
     });
   };
-  const startCallHost = async () => {
-    if (!isHost || inCall || !room) return;
-    setStarting(true);
-    try {
-      await new Promise((resolve) => socketRef.current?.emit("room:live", true, resolve));
-      iceRef.current = await getIceServers();
+  const startCallHost = async (toId) => {
+  if (!isHost || inCall || !room) return;
+  setStarting(true);
+  try {
+    iceRef.current = await getIceServers();
+    const pc = await setupPeer();
+    const ms = await getLocalStream();
+    ms.getTracks().forEach((t) => pc.addTrack(t, ms));
 
-      const pc = await setupPeer();
-      const ms = await getLocalStream();
-      ms.getTracks().forEach((t) => pc.addTrack(t, ms));
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
 
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socketRef.current?.emit("rtc:offer", { offer });
-      setInCall(true);
-    } catch {
-      addMsg({ sys: true, ts: Date.now(), text: "Start failed" });
-      socketRef.current?.emit("room:live", false, () => {});
-    } finally {
-      setStarting(false);
-    }
-  };
+    // Target this guest only
+    socketRef.current?.emit("rtc:offer", { to: toId, offer });
+
+    setInCall(true);
+  } catch (e) {
+    addMsg({ sys: true, ts: Date.now(), text: "Start failed" });
+    socketRef.current?.emit("room:live", false, () => {});
+  } finally {
+    setStarting(false);
+  }
+};
   const endForAll = () => {
     if (!isHost || !room) return;
     socketRef.current?.emit("end-for-all", () => {});
