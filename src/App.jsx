@@ -138,16 +138,28 @@ s.on("rtc:ready", ({ guestId }) => {
   }, []);
 
   async function setupPeer() {
-    const pc = new RTCPeerConnection({ iceServers: iceRef.current });
-    pcRef.current = pc;
-    pc.onicecandidate = (e) => { if (e.candidate) socketRef.current?.emit("rtc:ice", { candidate: e.candidate }); };
-    pc.ontrack = (ev) => { const ms = ev.streams?.[0]; if (remoteRef.current && ms) remoteRef.current.srcObject = ms; };
-    pc.onconnectionstatechange = () => {
-      const st = pc.connectionState;
-      if (st === "failed" || st === "disconnected" || st === "closed") leaveCall();
-    };
-    return pc;
-  }
+  const pc = new RTCPeerConnection({ iceServers: iceRef.current });
+  pcRef.current = pc;
+
+  // ✅ ICE candidate handler
+  pc.onicecandidate = (e) => {
+    if (e.candidate) {
+      socketRef.current?.emit("rtc:ice", { candidate: e.candidate });
+    }
+  };
+
+  pc.ontrack = (ev) => {
+    const ms = ev.streams?.[0];
+    if (remoteRef.current && ms) remoteRef.current.srcObject = ms;
+  };
+
+  pc.onconnectionstatechange = () => {
+    const st = pc.connectionState;
+    if (st === "failed" || st === "disconnected" || st === "closed") leaveCall();
+  };
+
+  return pc;
+}
 
   async function getLocalStream() {
     const wantsAudioOnly = voiceOnly || videoOff;
