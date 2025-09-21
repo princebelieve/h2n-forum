@@ -332,22 +332,16 @@ export default function App() {
         </div>
 
         <SendBox
-          disabled={!room}
-          onSend={(text) => {
-            const t = String(text || "").trim();
-            if (!t) return;
-            const msg = { name: me, text: t, ts: Date.now() };
-            socketRef.current?.emit("chat", msg);
-            addMsg(msg);
-          }}
-        />
-      </div>
-    </div>
-  );
-}
+  disabled={!room}
+  onSend={(t) => {
+    // send to server only — let the server's "chat" event render it
+    socketRef.current?.emit("chat", { name: me, text: t, ts: Date.now() });
+  }}
+/>
 
 function SendBox({ disabled, onSend }) {
   const [text, setText] = useState("");
+
   return (
     <div className="send">
       <textarea
@@ -363,7 +357,14 @@ function SendBox({ disabled, onSend }) {
           }
         }}
       />
-      <button className="btn primary" disabled={disabled} onClick={() => { if (text.trim()) onSend(text); setText(""); }}>
+      <button
+        className="btn primary"
+        disabled={disabled}
+        onClick={() => {
+          if (text.trim()) onSend(text);
+          setText("");
+        }}
+      >
         Send
       </button>
     </div>
