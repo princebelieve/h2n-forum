@@ -64,7 +64,6 @@ export default function App() {
       setConnected(true);
       setSocketId(s.id);
       s.emit("hello", me);
-      addMsg({ sys: true, ts: Date.now(), text: "Connected to server" });
     });
     s.on("disconnect", () => setConnected(false));
     s.on("reconnect", () => setSocketId(s.id));
