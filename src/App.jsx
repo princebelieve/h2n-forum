@@ -4,7 +4,7 @@ import { io } from "socket.io-client";
 import "./App.css";
 
 const SERVER_URL = (import.meta.env.VITE_SERVER_URL || "").split(",")[0].trim();
-const TURN_URL   = (import.meta.env.VITE_TURN_URL   || "").trim();
+const TURN_URL = (import.meta.env.VITE_TURN_URL || "").trim();
 
 const AUDIO_ONLY = { audio: { echoCancellation: true, noiseSuppression: true }, video: false };
 const LOW_VIDEO = {
@@ -12,16 +12,13 @@ const LOW_VIDEO = {
   video: { width: { ideal: 640, max: 640 }, height: { ideal: 360, max: 360 }, frameRate: { max: 15 }, facingMode: "user" },
 };
 
-// --- TURN / ICE fetch (only change) ---
 async function getIceServers() {
   try {
     if (!TURN_URL) throw new Error("TURN_URL missing");
     const res = await fetch(TURN_URL, { cache: "no-store" });
-    if (!res.ok) throw new Error(`TURN fetch failed: ${res.status}`);
+    if (!res.ok) throw new Error(`TURN fetch ${res.status}`);
     const data = await res.json();
-
-    // Metered returns { iceServers: [...] }. If an array is returned directly, support that too.
-    const list = Array.isArray(data) ? data : data.iceServers;
+    const list = Array.isArray(data) ? data : (data?.iceServers ?? data);
     if (!Array.isArray(list) || list.length === 0) throw new Error("Empty TURN list");
     return list;
   } catch (err) {
@@ -70,10 +67,13 @@ export default function App() {
       addMsg({ sys: true, ts: Date.now(), text: "Connected to server" });
     });
     s.on("disconnect", () => setConnected(false));
-    s.io.on("reconnect", () => setSocketId(s.id));
+    s.on("reconnect", () => setSocketId(s.id));
 
     s.on("chat", (m) => addMsg(m));
-    s.on("room:live", (live) => setRoom((r) => (r ? { ...r, live } : r)));
+    s.on("room:live", (live) => {
+      console.log("room:live =>", live);
+      setRoom((r) => (r ? { ...r, live } : r));
+    });
     s.on("room:locked", (locked) => setRoom((r) => (r ? { ...r, locked } : r)));
 
     s.on("rtc:offer", async ({ offer }) => {
@@ -254,7 +254,7 @@ export default function App() {
       <div className="glass">
         <div className="head">
           <h1>{isHost ? "H2N Forum — Host" : "H2N Forum"}</h1>
-          <span className={`pill ${connected ? "ok" : ""}`}>{connected ? "Connected to server" : "Disconnected"}</span>
+        <span className={`pill ${connected ? "ok" : ""}`}>{connected ? "Connected to server" : "Disconnected"}</span>
           <span className="chip" onClick={() => { const n = prompt("Enter your name", me || ""); if (n !== null) setMe((n || "").trim() || "Me"); }}>
             <span className="chip-label">You:</span><span className="chip-name">{me}</span><span className="chip-edit">✎</span>
           </span>
