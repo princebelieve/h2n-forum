@@ -148,25 +148,25 @@ export default function App() {
 
   // Rooms
   const createRoom = () => {
-    socketRef.current?.emit("create-room", { name: roomName, pin }, (res) => {
-      if (!res?.ok) return addMsg({ sys: true, ts: Date.now(), text: "Create failed" });
-      setRoom(res.room);
-      addMsg({ sys: true, ts: Date.now(), text: `Created room: ${res.room.name} (${res.room.code})` });
-    });
-  };
+  socketRef.current?.emit("create-room", { name: roomName, pin }, (res) => {
+    if (!res?.ok) return addMsg({ sys: true, ts: Date.now(), text: "Create failed" });
+    setRoom(res.room);
+    // no addMsg here — server already announces "Created room ..."
+  });
+};
   const joinRoom = () => {
-    socketRef.current?.emit("join-room", { code: joinCode.trim(), pin: joinPin.trim() }, (res) => {
-      if (!res?.ok) return addMsg({ sys: true, ts: Date.now(), text: `Join failed: ${res?.error || ""}` });
-      setRoom(res.room);
-      addMsg({ sys: true, ts: Date.now(), text: `Joined room: ${res.room.name} (${res.room.code})` });
-    });
-  };
+  socketRef.current?.emit("join-room", { code: joinCode.trim(), pin: joinPin.trim() }, (res) => {
+    if (!res?.ok) return addMsg({ sys: true, ts: Date.now(), text: `Join failed: ${res?.error || ""}` });
+    setRoom(res.room);
+    // no addMsg here — server already announces "Joined room ..."
+  });
+};
   const leaveRoom = () => {
-    socketRef.current?.emit("leave-room");
-    setRoom(null);
-    leaveCall();
-    addMsg({ sys: true, ts: Date.now(), text: "Left room" });
-  };
+  socketRef.current?.emit("leave-room");
+  setRoom(null);
+  leaveCall();
+  // no addMsg here — server already announces "Left room"
+};
 
   // Host controls
   const toggleLock = () => {
