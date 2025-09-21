@@ -69,11 +69,14 @@ export default function App() {
     s.on("reconnect", () => setSocketId(s.id));
 
     s.on("chat", (m) => addMsg(m));
-    s.on("room:live", (live) => {
+    s.on("room:live", (payload) => {
+  // payload might be a boolean or an object like { live: true }
+  const live = typeof payload === "boolean" ? payload : payload?.live;
+
   console.log("room:live >", live);
   setRoom((r) => ({ ...r, live }));
 
-  // 👇 If this client is a guest and the host just went live, request an offer
+  // If this client is a guest and the host just went live, ask for an offer
   if (live && !isHost) {
     socketRef.current?.emit("rtc:ready");
   }
@@ -207,17 +210,18 @@ export default function App() {
     leaveCall();
   };
 
-  // Guest pre-permission
-  const joinCallGuest = async () => {
+  /// Guest pre-permission
+const joinCallGuest = async () => {
   if (inCall || !room?.live) return;
   try {
-    const ms = await navigator.mediaDevices.getUserMedia(voiceOnly ? AUDIO_ONLY : LOW_VIDEO);
-    stopStream(ms);
+    // Pre-warm mic (or mic+cam if voiceOnly is false) so permissions are granted
+    const ms = await navigator.mediaDevices.getUserMedia(
+      voiceOnly ? AUDIO_ONLY : LOW_VIDEO
+    );
+    stopStream(ms); // we only needed permission, not the stream yet
 
-    // 👇 Tell the server this guest is ready for an offer
+    // Tell the host we're ready to receive an offer
     socketRef.current?.emit("rtc:ready");
-
-    addMsg({ sys: true, ts: Date.now(), text: "Ready to join once host connects…" });
   } catch {
     addMsg({ sys: true, ts: Date.now(), text: "Mic/Camera permission denied" });
   }
