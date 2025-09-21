@@ -58,6 +58,13 @@ function leaveAllRooms(socket) {
   }
 }
 
+// === GUEST → HOST: I'm ready for an offer ===
+socket.on("rtc:ready", () => {
+  const room = [...rooms.values()].find(r => r.members.has(socket.id));
+  if (!room || !room.hostId) return;
+  io.to(room.hostId).emit("rtc:ready", { guestId: socket.id });
+});
+
 io.on("connection", (socket) => {
   socket.data = { name: "Guest" };
   socket.emit("chat", { sys: true, ts: Date.now(), text: "Connected to server" });
@@ -116,15 +123,21 @@ io.on("connection", (socket) => {
     cb({ ok: true });
   });
 
-  socket.on("rtc:offer", ({ offer } = {}) => {
-    for (const r of rooms.values()) if (r.members.has(socket.id)) io.to(r.code).emit("rtc:offer", { offer });
-  });
-  socket.on("rtc:answer", ({ answer } = {}) => {
-    for (const r of rooms.values()) if (r.members.has(socket.id)) io.to(r.code).emit("rtc:answer", { answer, from: socket.id });
-  });
-  socket.on("rtc:ice", ({ candidate } = {}) => {
-    for (const r of rooms.values()) if (r.members.has(socket.id)) io.to(r.code).emit("rtc:ice", { candidate, from: socket.id });
-  });
+  // HOST → GUEST: targeted offer
+socket.on("rtc:offer", ({ to, offer }) => {
+  if (!to) return;
+  io.to(to).emit("rtc:offer", { offer, from: socket.id });
+});
+  // GUEST → HOST: targeted answer
+socket.on("rtc:answer", ({ to, answer }) => {
+  if (!to) return;
+  io.to(to).emit("rtc:answer", { answer, from: socket.id });
+});
+  // Either direction: targeted ICE candidate
+socket.on("rtc:ice", ({ to, candidate }) => {
+  if (!to) return;
+  io.to(to).emit("rtc:ice", { candidate, from: socket.id });
+});
 
   socket.on("disconnect", () => leaveAllRooms(socket));
 });
