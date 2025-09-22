@@ -58,12 +58,6 @@ function leaveAllRooms(socket) {
   }
 }
 
-// === GUEST → HOST: I'm ready for an offer ===
-socket.on("rtc:ready", () => {
-  const room = [...rooms.values()].find(r => r.members.has(socket.id));
-  if (!room || !room.hostId) return;
-  io.to(room.hostId).emit("rtc:ready", { guestId: socket.id });
-});
 
 io.on("connection", (socket) => {
   socket.data = { name: "Guest" };
@@ -137,6 +131,11 @@ socket.on("rtc:answer", ({ to, answer }) => {
 socket.on("rtc:ice", ({ to, candidate }) => {
   if (!to) return;
   io.to(to).emit("rtc:ice", { candidate, from: socket.id });
+});
+socket.on("rtc:ready", () => {
+  const room = [...rooms.values()].find(r => r.members.has(socket.id));
+  if (!room || !room.hostId) return;
+  io.to(room.hostId).emit("rtc:ready", { guestId: socket.id });
 });
 
   socket.on("disconnect", () => leaveAllRooms(socket));
