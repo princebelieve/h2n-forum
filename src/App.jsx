@@ -367,16 +367,19 @@ const joinCallGuest = async () => {
                 </>
               )}
             </div>
-          ))}
-        </div>
+    ))} 
+  </div>
 
-        <SendBox
-  disabled={!room}
-  onSend={(t) => {
-    // send to server only — let the server's "chat" event render it
-    socketRef.current?.emit("chat", { name: me, text: t, ts: Date.now() });
-  }}
-/>
+  <SendBox
+    disabled={!room}
+    onSend={(t) => {
+      // send to server only – let the server's "chat" event render it
+      socketRef.current?.emit("chat", { name: me, text: t, ts: Date.now() });
+    }}
+  />
+  />
+);
+}
 
 function SendBox({ disabled, onSend }) {
   const [text, setText] = useState("");
