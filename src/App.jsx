@@ -34,6 +34,7 @@ export default function App() {
 
   const localRef = useRef(null);
   const remoteRef = useRef(null);
+  const peerIdRef = useRef(null);
 
   const [connected, setConnected] = useState(false);
   const [socketId, setSocketId] = useState(null);
@@ -83,10 +84,11 @@ export default function App() {
 });
     s.on("room:locked", (locked) => setRoom((r) => (r ? { ...r, locked } : r)));
 
-    // Host: when a guest is ready, start an offer to that specific guest
+  // Host: when a guest is ready, start an offer to that specific guest
 s.on("rtc:ready", ({ guestId }) => {
   if (!isHost || !guestId) return;
-  startCallHost(guestId);   // pass the peer id
+  peerIdRef.current = guestId;   // 👈 store the guest ID so ICE knows where to go
+  startCallHost(guestId);        // pass the peer id into start
 });
 
     s.on("rtc:offer", async ({ offer, from }) => {
@@ -206,6 +208,7 @@ s.on("rtc:ready", ({ guestId }) => {
   if (!isHost || inCall || !room) return;
   setStarting(true);
   try {
+    peerIdRef.current = toId;                 // remember target peer
     iceRef.current = await getIceServers();
     const pc = await setupPeer();
     const ms = await getLocalStream();
@@ -214,16 +217,15 @@ s.on("rtc:ready", ({ guestId }) => {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
 
-    // Target this guest only
+    // send offer to the specific guest
     socketRef.current?.emit("rtc:offer", { to: toId, offer });
 
     setInCall(true);
-  } catch (e) {
+  } catch (err) {
     addMsg({ sys: true, ts: Date.now(), text: "Start failed" });
     socketRef.current?.emit("room:live", false, () => {});
   } finally {
     setStarting(false);
-  }
 };
   const endForAll = () => {
     if (!isHost || !room) return;
