@@ -93,6 +93,8 @@ s.on("rtc:ready", ({ guestId }) => {
 
     s.on("rtc:offer", async ({ offer, from }) => {
   if (pcRef.current) return;
+  peerIdRef.current = from;              // remember host id
+
   iceRef.current = await getIceServers();
   const pc = await setupPeer();
   const ms = await getLocalStream();
@@ -102,7 +104,7 @@ s.on("rtc:ready", ({ guestId }) => {
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
 
-  // Answer back to the host that sent the offer
+  // answer back to the host that sent the offer
   socketRef.current?.emit("rtc:answer", { to: from, answer });
   setInCall(true);
 });
