@@ -145,12 +145,14 @@ s.on("rtc:ready", ({ guestId }) => {
   const pc = new RTCPeerConnection({ iceServers: iceRef.current });
   pcRef.current = pc;
 
-  // ✅ ICE candidate handler
-  pc.onicecandidate = (e) => {
-    if (e.candidate) {
-      socketRef.current?.emit("rtc:ice", { candidate: e.candidate });
-    }
-  };
+  // ✅ ICE candidate handler (targeted)
+pc.onicecandidate = (e) => {
+  if (!e.candidate || !peerIdRef.current) return; // don't send if we don't know who to send to
+  socketRef.current?.emit("rtc:ice", {
+    to: peerIdRef.current,          // <-- target socket id
+    candidate: e.candidate,
+  });
+};
 
   pc.ontrack = (ev) => {
     const ms = ev.streams?.[0];
