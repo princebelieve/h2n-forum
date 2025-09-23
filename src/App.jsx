@@ -70,8 +70,8 @@ const readyTimerRef  = useRef(null);     // guest re-announce “ready” timer
 
   const isHost = !!room.code && room.hostId === socketId;
 
-  // ---- socket lifecycle ----------------------------------------------
-  useEffect(() => {
+// === H2N PATCH: socket lifecycle (REPLACE WHOLE EFFECT) =================
+useEffect(() => {
   const s = io(SERVER_URL, { transports: ["websocket"], reconnection: true });
   socketRef.current = s;
 
@@ -83,51 +83,67 @@ const readyTimerRef  = useRef(null);     // guest re-announce “ready” timer
     addMsg({ sys: true, ts: Date.now(), text: "Connected to server" });
   };
   const onDisconnect = () => setConnected(false);
-  const onChat = (m) => setMsgs((p) => [...p.slice(-190), m]);
+  const onChat = (m) => setMsgs((p) => (p.length > 199 ? [...p.slice(-190), m] : [...p, m]));
+
+  // room status
+  const onRoomLive = (payload) => {
+    const live = typeof payload === "boolean" ? payload : payload?.live;
+    setRoom((r) => ({ ...r, live }));
+  };
+  const onRoomLocked = (locked) => setRoom((r) => ({ ...r, locked }));
+
+  // guest readiness -> host calls immediately if already live
+  const onRtcReady = ({ id }) => {
+    if (!isHost || !id) return;
+    peerIdRef.current = id;
+    if (room?.live) startCallHost(id);
+  };
+
+  // signaling (guest answering host)
+  const onRtcOffer = async ({ offer, from }) => {
+    if (pcRef.current) return;              // already have a peer
+    try {
+      peerIdRef.current = from;
+      const pc = await setupPeer();
+      const ms = await getLocalStream();
+      ms.getTracks().forEach((t) => pc.addTrack(t, ms));
+      await pc.setRemoteDescription(offer);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      s.emit("rtc:answer", { to: from, answer });
+      setInCall(true);
+    } catch {}
+  };
+
+  // host receiving guest’s ICE; guest receiving host’s ICE handled by your existing pc.onicecandidate
+  const onRtcIce = async ({ candidate, to }) => {
+    if (!candidate || !pcRef.current) return;
+    try { await pcRef.current.addIceCandidate(candidate); } catch {}
+  };
 
   s.on("connect", onConnect);
   s.on("disconnect", onDisconnect);
   s.on("chat", onChat);
-
-  // room events
-  s.on("room:live", (payload) => {
-    const live = typeof payload === "boolean" ? payload : payload?.live;
-    setRoom((r) => ({ ...r, live }));
-  });
-  s.on("room:locked", (locked) => setRoom((r) => ({ ...r, locked })));
-
-  // guest readiness
-  s.on("rtc:ready", ({ id }) => {
-    if (!isHost || !room?.live || !id) return;
-    peerIdRef.current = id;
-    startCallHost(id); // host will call this guest
-  });
-
-  // signaling
-  s.on("rtc:offer", async ({ offer, from }) => {
-    if (pcRef.current) return;
-    peerIdRef.current = from;
-    const pc = await setupPeer();
-    const ms = await getLocalStream();
-    ms.getTracks().forEach((t) => pc.addTrack(t, ms));
-    await pc.setRemoteDescription(offer);
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    s.emit("rtc:answer", { to: from, answer });
-    setInCall(true);
-  });
+  s.on("room:live", onRoomLive);
+  s.on("room:locked", onRoomLocked);
+  s.on("rtc:ready", onRtcReady);
+  s.on("rtc:offer", onRtcOffer);
+  s.on("rtc:ice", onRtcIce);
 
   return () => {
     s.off("connect", onConnect);
     s.off("disconnect", onDisconnect);
     s.off("chat", onChat);
-    s.off("room:live");
-    s.off("room:locked");
-    s.off("rtc:ready");
-    s.off("rtc:offer");
-    s.disconnect();
+    s.off("room:live", onRoomLive);
+    s.off("room:locked", onRoomLocked);
+    s.off("rtc:ready", onRtcReady);
+    s.off("rtc:offer", onRtcOffer);
+    s.off("rtc:ice", onRtcIce);
   };
-}, [me, isHost, room?.live]);
+  // re-run only when identity/role or live status changes
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [SERVER_URL, isHost, room?.live, me]);
+// =======================================================================
 
     s.on("rtc:answer", async ({ answer }) => {
       if (!pcRef.current) return;
