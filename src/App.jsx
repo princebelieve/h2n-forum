@@ -271,17 +271,26 @@ export default function App() {
   };
 
   const joinCallGuest = async () => {
-    if (inCall || !room?.live) return;
-    try {
-      // pre-ask permissions so offer/answer completes smoothly
-      const ms = await navigator.mediaDevices.getUserMedia(voiceOnly ? AUDIO_ONLY : LOW_VIDEO);
-      stopStream(ms); // only need permission, not stream yet
-      addMsg({ sys: true, ts: Date.now(), text: "Ready to join once host connects…" });
-      socketRef.current?.emit("rtc:ready"); // host listens and sends offer
-    } catch {
-      addMsg({ sys: true, ts: Date.now(), text: "Mic/Camera permission denied" });
-    }
-  };
+  // --- Guest pre-permission & ready signal ---
+const joinCallGuest = async () => {
+  if (inCall) return; // <- allow join even if host is already live
+  try {
+    // Pre-ask permissions so offer/answer completes smoothly
+    const ms = await navigator.mediaDevices.getUserMedia(
+      voiceOnly ? AUDIO_ONLY : LOW_VIDEO
+    );
+    stopStream(ms); // we only needed permission, not the stream yet
+
+    // Tell the host we're ready. Include our socket id so host can target us.
+    addMsg({ sys: true, ts: Date.now(), text: room?.live
+      ? "Joining call…"
+      : "Ready to join once host connects…" });
+
+    socketRef.current?.emit("rtc:ready", { id: socketRef.current?.id });
+  } catch (err) {
+    addMsg({ sys: true, ts: Date.now(), text: "Mic/Camera permission denied" });
+  }
+};
 
   const leaveCall = () => {
     setInCall(false);
