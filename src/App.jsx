@@ -72,44 +72,62 @@ export default function App() {
 
   // ---- socket lifecycle ----------------------------------------------
   useEffect(() => {
-    const s = io(SERVER_URL, { transports: ["websocket"], reconnection: true });
-    socketRef.current = s;
+  const s = io(SERVER_URL, { transports: ["websocket"], reconnection: true });
+  socketRef.current = s;
 
-    s.on("connect", () => {
-      setConnected(true);
-      setSocketId(s.id);
-      s.emit("hello", me);
-      // IMPORTANT: do NOT add a local "Connected to server" message here
-      // (server already emits one). This prevents the duplicate.
-    });
+  // connection events
+  const onConnect = () => {
+    setConnected(true);
+    setSocketId(s.id);
+    s.emit("hello", me);
+    addMsg({ sys: true, ts: Date.now(), text: "Connected to server" });
+  };
+  const onDisconnect = () => setConnected(false);
+  const onChat = (m) => setMsgs((p) => [...p.slice(-190), m]);
 
-    s.on("disconnect", () => setConnected(false));
-    s.on("reconnect", () => setSocketId(s.id));
+  s.on("connect", onConnect);
+  s.on("disconnect", onDisconnect);
+  s.on("chat", onChat);
 
-    // system/chat feed
-    s.on("chat", (m) => addMsg(m));
+  // room events
+  s.on("room:live", (payload) => {
+    const live = typeof payload === "boolean" ? payload : payload?.live;
+    setRoom((r) => ({ ...r, live }));
+  });
+  s.on("room:locked", (locked) => setRoom((r) => ({ ...r, locked })));
 
-    // room live & lock status
-    s.on("room:live", (payload) => {
-      const live = typeof payload === "boolean" ? payload : payload?.live;
-      setRoom((r) => ({ ...r, live }));
-    });
-    s.on("room:locked", (locked) => setRoom((r) => ({ ...r, locked })));
+  // guest readiness
+  s.on("rtc:ready", ({ id }) => {
+    if (!isHost || !room?.live || !id) return;
+    peerIdRef.current = id;
+    startCallHost(id); // host will call this guest
+  });
 
-    // signaling
-    s.on("rtc:offer",  async ({ offer, from }) => {
-      if (pcRef.current) return;             // already have a peer
-      peerIdRef.current = from;              // remember who sent it
-      await ensureIce();
-      const pc = await setupPeer();
-      const ms = await getLocalStream();
-      ms.getTracks().forEach((t) => pc.addTrack(t, ms));
-      await pc.setRemoteDescription(offer);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      s.emit("rtc:answer", { to: from, answer });
-      setInCall(true);
-    });
+  // signaling
+  s.on("rtc:offer", async ({ offer, from }) => {
+    if (pcRef.current) return;
+    peerIdRef.current = from;
+    const pc = await setupPeer();
+    const ms = await getLocalStream();
+    ms.getTracks().forEach((t) => pc.addTrack(t, ms));
+    await pc.setRemoteDescription(offer);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    s.emit("rtc:answer", { to: from, answer });
+    setInCall(true);
+  });
+
+  return () => {
+    s.off("connect", onConnect);
+    s.off("disconnect", onDisconnect);
+    s.off("chat", onChat);
+    s.off("room:live");
+    s.off("room:locked");
+    s.off("rtc:ready");
+    s.off("rtc:offer");
+    s.disconnect();
+  };
+}, [me, isHost, room?.live]);
 
     s.on("rtc:answer", async ({ answer }) => {
       if (!pcRef.current) return;
