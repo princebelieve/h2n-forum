@@ -235,35 +235,43 @@ export default function App() {
     });
   };
 
-  // ---- call controls --------------------------------------------------
-  const startCallHost = async () => {
-    if (!isHost || inCall || !room) return;
-    setStarting(true);
-    try {
-      await new Promise((resolve) => socketRef.current?.emit("room:live", true, resolve));
-      await ensureIce();
-      peerIdRef.current = null; // set later when guest “ready”
-      const pc = await setupPeer();
-      const ms = await getLocalStream();
-      ms.getTracks().forEach((t) => pc.addTrack(t, ms));
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
+// ---- call controls ----------------------------------------------------------
+const startCallHost = async () => {
+  if (!isHost || inCall || !room) return;
+  setStarting(true);
+  try {
+    await ensureIce();
 
-      // send offer to the specific guest that became ready
-      socketRef.current?.once("rtc:ready", ({ to }) => {
-        peerIdRef.current = to;
-        socketRef.current?.emit("rtc:offer", { to, offer });
-      });
+    // Prepare RTCPeerConnection + local media
+    peerIdRef.current = null;                // will be set to the guest id we target
+    const pc = await setupPeer();
+    const ms = await getLocalStream();
+    ms.getTracks().forEach((t) => pc.addTrack(t, ms));
 
-      setInCall(true);
-    } catch (err) {
-      addMsg({ sys: true, ts: Date.now(), text: "Start failed" });
-      socketRef.current?.emit("room:live", false, () => {});
-    } finally {
-      setStarting(false);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    // If a guest has already pressed Join (we captured it in readyPeerRef),
+    // send the offer to that guest immediately; otherwise wait for the next one.
+    const sendOffer = (to) => {
+      peerIdRef.current = to;
+      socketRef.current?.emit("rtc:offer", { to, offer });
+    };
+
+    if (readyPeerRef.current) {
+      sendOffer(readyPeerRef.current);
+    } else {
+      socketRef.current?.once("rtc:ready", ({ to }) => sendOffer(to));
     }
-  };
 
+    setInCall(true);
+  } catch (err) {
+    addMsg({ sys: true, ts: Date.now(), text: "Start failed" });
+    socketRef.current?.emit("room:live", false, () => {});
+  } finally {
+    setStarting(false);
+  }
+};
   const endForAll = () => {
     if (!isHost || !room) return;
     socketRef.current?.emit("end-for-all", () => {});
