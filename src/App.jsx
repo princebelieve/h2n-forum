@@ -639,3 +639,38 @@ export default function App() {
     </div>
   );
 } // <-- closes App()
+
+
+// =========================
+// Section 6 — SendBox
+// =========================
+function SendBox({ disabled, onSend }) {
+  const [text, setText] = useState("");
+
+  const send = () => {
+    const t = (text || "").trim();
+    if (!t) return;
+    onSend(t);
+    setText("");
+  };
+
+  return (
+    <div className="send">
+      <textarea
+        disabled={disabled}
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder="Type a message… (Enter to send, Shift+Enter for new line)"
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            send();
+          }
+        }}
+      />
+      <button className="btn primary" disabled={disabled} onClick={send}>
+        Send
+      </button>
+    </div>
+  );
+}
