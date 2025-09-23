@@ -249,9 +249,6 @@ useEffect(() => {
     socketRef.current?.emit("room:lock", !room.locked, (res) => {
       if (res?.ok) setRoom((r) => ({ ...r, locked: res.locked }));
     });
-  };
-
-// ---- call controls ----------------------------------------------------------
 // === H2N PATCH: calling logic (REPLACE) =================================
 const startCallHost = async (targetId) => {
   if (!isHost || inCall || !room) return;
@@ -312,6 +309,7 @@ if (readyTimerRef.current) {
   readyTimerRef.current = null;
 }
 // =======================================================================
+    
       if (pc) {
         try { pc.getSenders?.().forEach((s) => s.track && s.track.stop()); } catch {}
         try { pc.getTransceivers?.().forEach((t) => t.stop?.()); } catch {}
