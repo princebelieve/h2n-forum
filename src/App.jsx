@@ -252,14 +252,20 @@ useEffect(() => {
   };
 
 // ---- call controls ----------------------------------------------------------
-const startCallHost = async () => {
+// === H2N PATCH: calling logic (REPLACE) =================================
+const startCallHost = async (targetId) => {
   if (!isHost || inCall || !room) return;
   setStarting(true);
   try {
     await ensureIce();
 
-    // Prepare RTCPeerConnection + local media
-    peerIdRef.current = null;                // will be set to the guest id we target
+    // wait for a specific guest if not already provided
+    const id = targetId || await new Promise((resolve) => {
+      socketRef.current?.once("rtc:ready", ({ id }) => resolve(id));
+    });
+
+    peerIdRef.current = id;
+
     const pc = await setupPeer();
     const ms = await getLocalStream();
     ms.getTracks().forEach((t) => pc.addTrack(t, ms));
@@ -267,19 +273,7 @@ const startCallHost = async () => {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
 
-    // If a guest has already pressed Join (we captured it in readyPeerRef),
-    // send the offer to that guest immediately; otherwise wait for the next one.
-    const sendOffer = (to) => {
-      peerIdRef.current = to;
-      socketRef.current?.emit("rtc:offer", { to, offer });
-    };
-
-    if (readyPeerRef.current) {
-      sendOffer(readyPeerRef.current);
-    } else {
-      socketRef.current?.once("rtc:ready", ({ to }) => sendOffer(to));
-    }
-
+    socketRef.current?.emit("rtc:offer", { to: id, offer });
     setInCall(true);
   } catch (err) {
     addMsg({ sys: true, ts: Date.now(), text: "Start failed" });
@@ -288,39 +282,36 @@ const startCallHost = async () => {
     setStarting(false);
   }
 };
-  const endForAll = () => {
-    if (!isHost || !room) return;
-    socketRef.current?.emit("end-for-all", () => {});
-    leaveCall();
-  };
 
-  const joinCallGuest = async () => {
-  // --- Guest pre-permission & ready signal ---
 const joinCallGuest = async () => {
-  if (inCall) return; // <- allow join even if host is already live
+  if (inCall) return; // can press Join at any time; if already in call, ignore
   try {
-    // Pre-ask permissions so offer/answer completes smoothly
-    const ms = await navigator.mediaDevices.getUserMedia(
-      voiceOnly ? AUDIO_ONLY : LOW_VIDEO
-    );
-    stopStream(ms); // we only needed permission, not the stream yet
+    // warm permissions so answer flows smoothly once host calls
+    const ms = await navigator.mediaDevices.getUserMedia(voiceOnly ? AUDIO_ONLY : LOW_VIDEO);
+    stopStream(ms); // only needed permission, not the stream
+    addMsg({ sys: true, ts: Date.now(), text: "Ready to join" });
 
-    // Tell the host we're ready. Include our socket id so host can target us.
-    addMsg({ sys: true, ts: Date.now(), text: room?.live
-      ? "Joining call…"
-      : "Ready to join once host connects…" });
+    // announce ready now + every 5s until actually connected
+    const announce = () => socketRef.current?.emit("rtc:ready", { id: socketId });
+    announce();
 
-    socketRef.current?.emit("rtc:ready", { id: socketRef.current?.id });
-  } catch (err) {
+    if (readyTimerRef.current) clearInterval(readyTimerRef.current);
+    readyTimerRef.current = setInterval(() => {
+      if (!inCall) announce();
+      else { clearInterval(readyTimerRef.current); readyTimerRef.current = null; }
+    }, 5000);
+  } catch {
     addMsg({ sys: true, ts: Date.now(), text: "Mic/Camera permission denied" });
   }
 };
+// =======================================================================
 
-  const leaveCall = () => {
-    setInCall(false);
-    try {
-      const pc = pcRef.current;
-      pcRef.current = null;
+// === H2N PATCH: leaveCall cleanup (ADD INSIDE your existing leaveCall) ==
+if (readyTimerRef.current) {
+  clearInterval(readyTimerRef.current);
+  readyTimerRef.current = null;
+}
+// =======================================================================
       if (pc) {
         try { pc.getSenders?.().forEach((s) => s.track && s.track.stop()); } catch {}
         try { pc.getTransceivers?.().forEach((t) => t.stop?.()); } catch {}
