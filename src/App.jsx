@@ -31,13 +31,13 @@ async function getIceServers() {
 
 export default function App() {
   // ---- refs -----------------------------------------------------------
-  const socketRef   = useRef(null);
-  const iceRef      = useRef([{ urls: ["stun:stun1.l.google.com:19302"] }]);
-  const pcRef       = useRef(null);
-  const localRef    = useRef(null);
-  const remoteRef   = useRef(null);
-  const peerIdRef   = useRef(null);     // who we are targeting
-
+  const socketRef      = useRef(null);
+const iceRef         = useRef([{ urls: ["stun:stun1.l.google.com:19302"] }]);
+const pcRef          = useRef(null);
+const localRef       = useRef(null);
+const remoteRef      = useRef(null);
+const peerIdRef      = useRef(null);     // who we are calling / who calls us
+const readyTimerRef  = useRef(null);     // guest re-announce “ready” timer
   // ---- state ----------------------------------------------------------
   const [connected, setConnected] = useState(false);
   const [socketId,  setSocketId ] = useState(null);
