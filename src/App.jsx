@@ -1,195 +1,154 @@
-// src/App.jsx
+// src/App.jsx — Section 1: imports + refs + state
 import { useEffect, useRef, useState } from "react";
 import io from "socket.io-client";
 import "./App.css";
 
-// ---- ENV / constants -------------------------------------------------
-const SERVER_URL = (import.meta.env.VITE_SERVER_URL || "").split(",")[0]?.trim();
-const TURN_URL   = (import.meta.env.VITE_TURN_URL   || "").trim();
+// ---- env / endpoints --------------------------------------------------------
+const SERVER_URL =
+  (import.meta.env?.VITE_SERVER_URL || "").split(",")[0]?.trim() ||
+  window.location.origin;
 
-const AUDIO_ONLY = { audio: { echoCancellation: true, noiseSuppression: true }, video: false };
-const LOW_VIDEO  = {
-  audio: { echoCancellation: true, noiseSuppression: true },
-  video: { width: { ideal: 640, max: 640 }, height: { ideal: 360, max: 360 }, frameRate: { max: 15 }, facingMode: "user" }
-};
+const TURN_URL = (import.meta.env?.VITE_TURN_URL || "").trim(); // optional
 
-// Robust TURN fetch with STUN fallback
-async function getIceServers() {
-  try {
-    if (!TURN_URL) throw new Error("TURN_URL missing");
-    const res = await fetch(TURN_URL, { cache: "no-store" });
-    if (!res.ok) throw new Error(`TURN fetch ${res.status}`);
-    const data = await res.json();
-    const list = Array.isArray(data) ? data : (data?.iceServers ?? data);
-    if (!Array.isArray(list) || list.length === 0) throw new Error("Empty TURN list");
-    return list;
-  } catch (err) {
-    console.warn("TURN fetch failed, fallback to STUN:", err?.message || err);
-    return [{ urls: ["stun:stun1.l.google.com:19302"] }];
-  }
-}
-
+// ---- component --------------------------------------------------------------
 export default function App() {
-  // ---- refs -----------------------------------------------------------
-  const socketRef      = useRef(null);
-const iceRef         = useRef([{ urls: ["stun:stun1.l.google.com:19302"] }]);
-const pcRef          = useRef(null);
-const localRef       = useRef(null);
-const remoteRef      = useRef(null);
-const peerIdRef      = useRef(null);     // who we are calling / who calls us
-const readyTimerRef  = useRef(null);     // guest re-announce “ready” timer
-  // ---- state ----------------------------------------------------------
+  // ---- refs -----------------------------------------------------------------
+  const socketRef = useRef(null);
+  const pcRef = useRef(null);
+  const localRef = useRef(null);
+  const remoteRef = useRef(null);
+
+  // ICE list starts with public STUN; we may extend with TURN later
+  const iceRef = useRef([{ urls: "stun:stun1.l.google.com:19302" }]);
+
+  // who we are calling / who calls us
+  const peerIdRef = useRef(null);
+
+  // guest “ready” re-announce timer (prevents being stuck)
+  const readyTimerRef = useRef(null);
+
+  // audio elements (ringing / ringback)
+  const incomingAudioRef = useRef(null);
+  const ringbackAudioRef = useRef(null);
+
+  // ---- state ----------------------------------------------------------------
   const [connected, setConnected] = useState(false);
-  const [socketId,  setSocketId ] = useState(null);
-  const [me, setMe]               = useState(() => localStorage.getItem("me") || "Me");
+  const [socketId, setSocketId] = useState(null);
+  const [me, setMe] = useState(() => localStorage.getItem("me") || "Me");
 
   const [room, setRoom] = useState({
-    code: null,       // room code
-    name: null,       // room name (optional)
-    hostId: null,     // host socket id
+    code: null,   // 6-digit code
+    name: null,   // optional room name
+    hostId: null, // socket id of current host
     locked: false,
-    live: false
+    live: false,
   });
+
+  // inputs
   const [roomName, setRoomName] = useState("");
-  const [pin,      setPin]      = useState("");
-
+  const [pin, setPin] = useState("");
   const [joinCode, setJoinCode] = useState("");
-  const [joinPin,  setJoinPin ] = useState("");
+  const [joinPin, setJoinPin] = useState("");
 
+  // flags
   const [voiceOnly, setVoiceOnly] = useState(false);
-  const [starting,  setStarting ] = useState(false);
-  const [inCall,    setInCall   ] = useState(false);
-  const [muted,     setMuted    ] = useState(false);
-  const [videoOff,  setVideoOff ] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [inCall, setInCall] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const [videoOff, setVideoOff] = useState(false);
 
+  // chat
   const [msgs, setMsgs] = useState([]);
   const msgsRef = useRef(null);
 
+  // derived
+  const isHost = !!room.code && room.hostId === socketId;
+
+  // small helper to push a message and keep last ~200
   const addMsg = (m) =>
     setMsgs((p) => (p.length > 199 ? [...p.slice(-190), m] : [...p, m]));
 
-  const isHost = !!room.code && room.hostId === socketId;
+  // (handlers, effects, UI come in later sections)
 
-// === H2N PATCH: socket lifecycle (REPLACE WHOLE EFFECT) =================
-useEffect(() => {
-  const s = io(SERVER_URL, { transports: ["websocket"], reconnection: true });
-  socketRef.current = s;
+// =========================
+  // Section 2 — Helpers
+  // =========================
 
-  // connection events
-  const onConnect = () => {
-    setConnected(true);
-    setSocketId(s.id);
-    s.emit("hello", me);
-    addMsg({ sys: true, ts: Date.now(), text: "Connected to server" });
-  };
-  const onDisconnect = () => setConnected(false);
-  const onChat = (m) => setMsgs((p) => (p.length > 199 ? [...p.slice(-190), m] : [...p, m]));
-
-  // room status
-  const onRoomLive = (payload) => {
-    const live = typeof payload === "boolean" ? payload : payload?.live;
-    setRoom((r) => ({ ...r, live }));
-  };
-  const onRoomLocked = (locked) => setRoom((r) => ({ ...r, locked }));
-
-  // guest readiness -> host calls immediately if already live
-  const onRtcReady = ({ id }) => {
-    if (!isHost || !id) return;
-    peerIdRef.current = id;
-    if (room?.live) startCallHost(id);
+  // -- call quality constraints --
+  const AUDIO_ONLY = { audio: { echoCancellation: true, noiseSuppression: true }, video: false };
+  const LOW_VIDEO = {
+    audio: { echoCancellation: true, noiseSuppression: true },
+    video: { width: { ideal: 640, max: 640 }, height: { ideal: 360, max: 360 }, frameRate: { max: 15 }, facingMode: "user" },
   };
 
-  // signaling (guest answering host)
-  const onRtcOffer = async ({ offer, from }) => {
-    if (pcRef.current) return;              // already have a peer
-    try {
-      peerIdRef.current = from;
-      const pc = await setupPeer();
-      const ms = await getLocalStream();
-      ms.getTracks().forEach((t) => pc.addTrack(t, ms));
-      await pc.setRemoteDescription(offer);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      s.emit("rtc:answer", { to: from, answer });
-      setInCall(true);
-    } catch {}
-  };
+  // -- tiny message helper --
+  const sys = (text) => addMsg({ sys: true, ts: Date.now(), text });
 
-  // host receiving guest’s ICE; guest receiving host’s ICE handled by your existing pc.onicecandidate
-  const onRtcIce = async ({ candidate, to }) => {
-    if (!candidate || !pcRef.current) return;
-    try { await pcRef.current.addIceCandidate(candidate); } catch {}
-  };
+  // -- sounds: preload + unlock after first tap/click --
+  useEffect(() => {
+    incomingAudioRef.current = new Audio("/sounds/incoming.mp3"); // callee ringtone
+    incomingAudioRef.current.loop = true;
+    ringbackAudioRef.current = new Audio("/sounds/ringback.mp3"); // caller tone
+    ringbackAudioRef.current.loop = true;
 
-  s.on("connect", onConnect);
-  s.on("disconnect", onDisconnect);
-  s.on("chat", onChat);
-  s.on("room:live", onRoomLive);
-  s.on("room:locked", onRoomLocked);
-  s.on("rtc:ready", onRtcReady);
-  s.on("rtc:offer", onRtcOffer);
-  s.on("rtc:ice", onRtcIce);
-
-  return () => {
-    s.off("connect", onConnect);
-    s.off("disconnect", onDisconnect);
-    s.off("chat", onChat);
-    s.off("room:live", onRoomLive);
-    s.off("room:locked", onRoomLocked);
-    s.off("rtc:ready", onRtcReady);
-    s.off("rtc:offer", onRtcOffer);
-    s.off("rtc:ice", onRtcIce);
-  };
-  // re-run only when identity/role or live status changes
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, [SERVER_URL, isHost, room?.live, me]);
-// =======================================================================
-
-    s.on("rtc:answer", async ({ answer }) => {
-      if (!pcRef.current) return;
-      try { await pcRef.current.setRemoteDescription(answer); } catch {}
-    });
-
-    s.on("rtc:ice", async ({ candidate }) => {
-      if (!candidate || !pcRef.current) return;
-      try { await pcRef.current.addIceCandidate(candidate); } catch {}
-    });
-
-    s.on("end-call", () => leaveCall());
+    const unlock = () => {
+      // best-effort unlock; ignore failures
+      incomingAudioRef.current?.play().catch(()=>{});
+      incomingAudioRef.current?.pause();
+      incomingAudioRef.current && (incomingAudioRef.current.currentTime = 0);
+      ringbackAudioRef.current?.play().catch(()=>{});
+      ringbackAudioRef.current?.pause();
+      ringbackAudioRef.current && (ringbackAudioRef.current.currentTime = 0);
+      document.removeEventListener("pointerdown", unlock, { capture: true });
+      document.removeEventListener("keydown", unlock, { capture: true });
+    };
+    document.addEventListener("pointerdown", unlock, { capture: true });
+    document.addEventListener("keydown", unlock,   { capture: true });
 
     return () => {
-      s.removeAllListeners();
-      s.disconnect();
+      document.removeEventListener("pointerdown", unlock, { capture: true });
+      document.removeEventListener("keydown", unlock,   { capture: true });
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // scroll messages
-  useEffect(() => {
-    msgsRef.current?.scrollTo({ top: msgsRef.current.scrollHeight, behavior: "smooth" });
-  }, [msgs]);
+  const playIncoming  = () => { try { incomingAudioRef.current?.play(); } catch {} };
+  const stopIncoming  = () => { try { incomingAudioRef.current?.pause(); incomingAudioRef.current.currentTime = 0; } catch {} };
+  const playRingback  = () => { try { ringbackAudioRef.current?.play(); } catch {} };
+  const stopRingback  = () => { try { ringbackAudioRef.current?.pause(); ringbackAudioRef.current.currentTime = 0; } catch {} };
 
-  // read ?code=&pin= from URL for guest
-  useEffect(() => {
-    const p = new URLSearchParams(location.search);
-    const c = p.get("code"), p0 = p.get("pin");
-    if (c) setJoinCode(c);
-    if (p0) setJoinPin(p0);
-  }, []);
-
-  // ---- peer helpers ---------------------------------------------------
-  async function ensureIce() {
-    // fetch once per session
-    if (iceRef.current?.__fetched) return;
-    iceRef.current = await getIceServers();
-    iceRef.current.__fetched = true;
+  // -- TURN fetch (optional) + ICE merge --
+  async function ensureIceServers() {
+    if (!TURN_URL) return; // keep STUN-only if no TURN configured
+    try {
+      const res = await fetch(TURN_URL);
+      if (!res.ok) throw new Error(`TURN ${res.status}`);
+      const arr = await res.json();
+      if (Array.isArray(arr) && arr.length) {
+        // place TURN first, keep STUN as fallback
+        iceRef.current = [...arr, { urls: "stun:stun1.l.google.com:19302" }];
+      }
+    } catch (e) {
+      console.warn("TURN fetch failed, staying on STUN:", e?.message || e);
+    }
   }
 
-  async function setupPeer() {
-    const pc = new RTCPeerConnection({ iceServers: iceRef.current });
-    pcRef.current = pc;
+  // -- media helpers --
+  async function getLocalStream(kind = "video") {
+    const wantAudioOnly = kind === "audio";
+    const ms = await navigator.mediaDevices.getUserMedia(wantAudioOnly || voiceOnly ? AUDIO_ONLY : LOW_VIDEO);
+    if (localRef.current) localRef.current.srcObject = ms;
+    return ms;
+  }
+  function stopStream(ms) {
+    if (!ms) return;
+    ms.getTracks?.().forEach(t => { try { t.stop(); } catch {} });
+  }
 
-    // targeted ICE
+  // -- RTCPeerConnection setup (shared by host/guest) --
+  async function setupPeer() {
+    await ensureIceServers();
+    const pc = new RTCPeerConnection({ iceServers: iceRef.current });
+
     pc.onicecandidate = (e) => {
       if (!e.candidate || !peerIdRef.current) return;
       socketRef.current?.emit("rtc:ice", { to: peerIdRef.current, candidate: e.candidate });
@@ -197,277 +156,122 @@ useEffect(() => {
 
     pc.ontrack = (ev) => {
       const ms = ev.streams?.[0];
-      if (remoteRef.current) remoteRef.current.srcObject = ms;
+      if (remoteRef.current && ms) remoteRef.current.srcObject = ms;
     };
 
     pc.onconnectionstatechange = () => {
       const st = pc.connectionState;
-      if (st === "failed" || st === "disconnected" || st === "closed") leaveCall();
+      if (st === "failed" || st === "disconnected" || st === "closed") {
+        leaveCall(); // will be defined later
+      }
     };
 
+    pcRef.current = pc;
     return pc;
   }
+// =========================
+  // Section 3 — Socket & RTC handlers
+  // =========================
+  useEffect(() => {
+    const s = io(SERVER_URL, { transports: ["websocket"], reconnection: true });
+    socketRef.current = s;
 
-  async function getLocalStream() {
-    const wantsAudioOnly = voiceOnly || videoOff;
-    const ms = await navigator.mediaDevices.getUserMedia(wantsAudioOnly ? AUDIO_ONLY : LOW_VIDEO);
-    if (localRef.current) localRef.current.srcObject = ms;
-    return ms;
-  }
+    // --- connection ---
+    const onConnect = () => {
+      setConnected(true);
+      setSocketId(s.id);
+      s.emit("hello", me);
+      sys("Connected to server");
+    };
+    const onDisconnect = () => setConnected(false);
+    s.on("connect", onConnect);
+    s.on("disconnect", onDisconnect);
 
-  function stopStream(ms) {
-    if (!ms) return;
-    for (const t of ms.getTracks()) try { t.stop(); } catch {}
-  }
+    // --- chat ---
+    s.on("chat", (m) => addMsg(m));
 
-  // ---- room actions ---------------------------------------------------
-  const createRoom = () => {
-    socketRef.current?.emit("create-room", { name: roomName, pin }, (res) => {
-      if (!res?.ok) return addMsg({ sys: true, ts: Date.now(), text: "Create failed" });
-      setRoom(res.room);
-      addMsg({ sys: true, ts: Date.now(), text: `Created room: ${res.room.name ?? ""} (${res.room.code})` });
+    // --- room live/lock broadcasts ---
+    s.on("room:live", (payload) => {
+      const live = typeof payload === "boolean" ? payload : payload?.live;
+      setRoom((r) => ({ ...r, live }));
+      if (!live) { stopIncoming(); stopRingback(); }
     });
-  };
+    s.on("room:locked", (locked) => setRoom((r) => ({ ...r, locked })));
 
-  const joinRoom = () => {
-    socketRef.current?.emit("join-room", { code: joinCode.trim(), pin: joinPin.trim() }, (res) => {
-      if (!res?.ok) return addMsg({ sys: true, ts: Date.now(), text: `Join failed: ${res?.error || ""}` });
-      setRoom(res.room);
-      addMsg({ sys: true, ts: Date.now(), text: `Joined room: ${res.room.name ?? ""} (${res.room.code})` });
-    });
-  };
-
-  const leaveRoom = () => {
-    socketRef.current?.emit("leave-room");
-    setRoom({ code: null, name: null, hostId: null, locked: false, live: false });
-    leaveCall(); // if in call
-    addMsg({ sys: true, ts: Date.now(), text: "Left room" });
-  };
-
-  const toggleLock = () => {
-    if (!isHost) return;
-    socketRef.current?.emit("room:lock", !room.locked, (res) => {
-      if (res?.ok) setRoom((r) => ({ ...r, locked: res.locked }));
-    });
-// === H2N PATCH: calling logic (REPLACE) =================================
-const startCallHost = async (targetId) => {
-  if (!isHost || inCall || !room) return;
-  setStarting(true);
-  try {
-    await ensureIce();
-
-    // wait for a specific guest if not already provided
-    const id = targetId || await new Promise((resolve) => {
-      socketRef.current?.once("rtc:ready", ({ id }) => resolve(id));
-    });
-
-    peerIdRef.current = id;
-
-    const pc = await setupPeer();
-    const ms = await getLocalStream();
-    ms.getTracks().forEach((t) => pc.addTrack(t, ms));
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    socketRef.current?.emit("rtc:offer", { to: id, offer });
-    setInCall(true);
-  } catch (err) {
-    addMsg({ sys: true, ts: Date.now(), text: "Start failed" });
-    socketRef.current?.emit("room:live", false, () => {});
-  } finally {
-    setStarting(false);
-  }
-};
-
-const joinCallGuest = async () => {
-  if (inCall) return; // can press Join at any time; if already in call, ignore
-  try {
-    // warm permissions so answer flows smoothly once host calls
-    const ms = await navigator.mediaDevices.getUserMedia(voiceOnly ? AUDIO_ONLY : LOW_VIDEO);
-    stopStream(ms); // only needed permission, not the stream
-    addMsg({ sys: true, ts: Date.now(), text: "Ready to join" });
-
-    // announce ready now + every 5s until actually connected
-    const announce = () => socketRef.current?.emit("rtc:ready", { id: socketId });
-    announce();
-
-    if (readyTimerRef.current) clearInterval(readyTimerRef.current);
-    readyTimerRef.current = setInterval(() => {
-      if (!inCall) announce();
-      else { clearInterval(readyTimerRef.current); readyTimerRef.current = null; }
-    }, 5000);
-  } catch {
-    addMsg({ sys: true, ts: Date.now(), text: "Mic/Camera permission denied" });
-  }
-};
-// =======================================================================
-
-// === H2N PATCH: leaveCall cleanup (ADD INSIDE your existing leaveCall) ==
-if (readyTimerRef.current) {
-  clearInterval(readyTimerRef.current);
-  readyTimerRef.current = null;
-}
-// =======================================================================
-    
-      if (pc) {
-        try { pc.getSenders?.().forEach((s) => s.track && s.track.stop()); } catch {}
-        try { pc.getTransceivers?.().forEach((t) => t.stop?.()); } catch {}
-        try { pc.close(); } catch {}
+    // --- guest announces readiness (host hears ringtone) ---
+    s.on("rtc:ready", ({ id }) => {
+      // only host cares; remember the latest ready guest
+      if (!id) return;
+      if (!room?.code) return;
+      // we can't use isHost from state here reliably inside handler,
+      // but comparing with room.hostId is fine:
+      if (room.hostId && room.hostId === s.id) {
+        peerIdRef.current = id;
+        playIncoming();
+        sys("Guest is ready");
       }
-    } catch {}
-    // stop streams shown in the UI
-    if (localRef.current?.srcObject) { stopStream(localRef.current.srcObject); localRef.current.srcObject = null; }
-    if (remoteRef.current?.srcObject) { stopStream(remoteRef.current.srcObject); remoteRef.current.srcObject = null; }
-    setMuted(false);
-    setVideoOff(false);
-  };
+    });
 
-  const toggleMute = () => {
-    const ms = localRef.current?.srcObject; if (!ms) return;
-    ms.getAudioTracks().forEach((t) => (t.enabled = !t.enabled));
-    setMuted((m) => !m);
-  };
+    // --- host receives guest's ICE / answer; both sides receive ICE ---
+    s.on("rtc:answer", async ({ answer }) => {
+      try { await pcRef.current?.setRemoteDescription(answer); } catch {}
+    });
 
-  const toggleVideo = () => {
-    const ms = localRef.current?.srcObject; if (!ms) return;
-    ms.getVideoTracks().forEach((t) => (t.enabled = !t.enabled));
-    setVideoOff((v) => !v);
-  };
+    s.on("rtc:ice", async ({ candidate }) => {
+      if (!candidate) return;
+      try { await pcRef.current?.addIceCandidate(candidate); } catch {}
+    });
 
-  const copyInvite = async () => {
-    if (!room) return;
-    const text = `${location.origin}?code=${room.code}${room.pin ? `&pin=${room.pin}` : ""}`;
-    try { await navigator.clipboard.writeText(text); addMsg({ sys: true, ts: Date.now(), text: "Invite link copied" }); }
-    catch { addMsg({ sys: true, ts: Date.now(), text }) }
-  };
+    // --- guest receives host offer -> stop ringback, answer immediately ---
+    s.on("rtc:offer", async ({ offer, from }) => {
+      stopRingback();
+      if (from) peerIdRef.current = from;
 
-  // ---- UI -------------------------------------------------------------
-  return (
-    <div className="shell">
-      <div className="glass">
-        <div className="head">
-          <h1>{isHost ? "H2N Forum — Host" : "H2N Forum"}</h1>
-          <span className="pill">{connected ? "Connected to server" : "Disconnected"}</span>
-          <span className="chip" onClick={() => { const n = prompt("Enter your name", me || ""); if (n != null) setMe(n); localStorage.setItem("me", n || "Me"); }}>{/* name edit */}</span>
-          <span className="chip-label">You:</span><span className="chip-name">{me}</span>
-        </div>
+      const pc = await setupPeer();
+      const ms = await getLocalStream(voiceOnly ? "audio" : "video");
+      ms.getTracks().forEach((t) => pc.addTrack(t, ms));
 
-        {!room.code && (
-          <>
-            <div className="row title">Create a meeting</div>
-            <div className="row">
-              <label>Room name</label>
-              <input value={roomName} onChange={(e) => setRoomName(e.target.value)} placeholder="Optional" />
-              <label>PIN</label>
-              <input value={pin} onChange={(e) => setPin(e.target.value)} placeholder="4–6 digits (optional)" />
-              <button className="btn primary" onClick={createRoom}>Create</button>
-            </div>
+      await pc.setRemoteDescription(offer);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socketRef.current?.emit("rtc:answer", { to: from, answer });
+      setInCall(true);
+    });
 
-            <div className="row title">Code + optional PIN</div>
-            <div className="row">
-              <label>6-digit code</label>
-              <input value={joinCode} onChange={(e) => setJoinCode(e.target.value)} placeholder="XXXXXX" />
-              <input value={joinPin} onChange={(e) => setJoinPin(e.target.value)} placeholder="PIN (if required)" />
-            </div>
-            <div className="hint">Rooms auto-delete after being empty for a while.</div>
-            <div className="row callbar">
-              <button className="btn primary" onClick={joinRoom}>Join</button>
-            </div>
-          </>
-        )}
+    // --- server tells everyone to end ---
+    s.on("end-call", () => leaveCall());
 
-        {room.code && (
-          <>
-            <div className="row">
-              <div className="inroom">
-                In room: <b>{room.name || "Room"}</b> <span style={{ opacity: 0.85 }}>#{room.code}</span>
-              </div>
-              <button className="link" onClick={copyInvite}>Copy invite</button>
-              <button className="link" onClick={leaveRoom}>Leave</button>
-            </div>
+    return () => {
+      s.off("connect", onConnect);
+      s.off("disconnect", onDisconnect);
+      s.off("chat");
+      s.off("room:live");
+      s.off("room:locked");
+      s.off("rtc:ready");
+      s.off("rtc:answer");
+      s.off("rtc:ice");
+      s.off("rtc:offer");
+      s.off("end-call");
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [me, room?.code, room?.hostId]);
 
-            <div className="row callbar">
-              {isHost && !inCall && (
-                <button className="btn primary" disabled={starting} onClick={startCallHost}>
-                  {starting ? "Starting…" : "Start call"}
-                </button>
-              )}
-              {!isHost && (
-                <button className="btn primary" disabled={!room.live || inCall} onClick={joinCallGuest}>
-                  Join call
-                </button>
-              )}
-              <button className="btn" disabled={!inCall} onClick={toggleMute}>{muted ? "Unmute" : "Mute"}</button>
-              <button className="btn" disabled={!inCall} onClick={toggleVideo}>{videoOff ? "Camera On" : "Camera Off"}</button>
-              {isHost && inCall && <button className="btn danger" onClick={endForAll}>End call for all</button>}
-              <div className="chk" style={{ marginLeft: "auto" }}>
-                <input type="checkbox" checked={voiceOnly} onChange={(e) => setVoiceOnly(e.target.checked)} />
-                <span>Voice only</span>
-              </div>
-            </div>
+  // persist name + re-hello
+  useEffect(() => {
+    localStorage.setItem("me", me);
+    socketRef.current?.emit("hello", me);
+  }, [me]);
 
-            <div className="media single">
-              <div className="remotePane">
-                <video ref={remoteRef} playsInline autoPlay />
-                <video ref={localRef} playsInline autoPlay muted className="pip" />
-              </div>
-            </div>
+  // scroll chat to bottom
+  useEffect(() => {
+    msgsRef.current?.scrollTo({ top: msgsRef.current.scrollHeight, behavior: "smooth" });
+  }, [msgs]);
 
-            <div className="msgs" ref={msgsRef} style={{ marginTop: 12 }}>
-              {msgs.map((m, i) => (
-                <div key={i} className={`bubble ${m.sys ? "sys" : ""}`}>
-                  {m.sys ? (
-                    <div className="meta"><span className="who">•</span><span className="ts">{new Date(m.ts).toLocaleTimeString()}</span></div>
-                  ) : (
-                    <div className="meta"><span className="who">{m.name}</span><span className="ts">{new Date(m.ts).toLocaleTimeString()}</span></div>
-                  )}
-                  <div>{m.text}</div>
-                </div>
-              ))}
-            </div>
-
-            <SendBox
-              disabled={!room}
-              onSend={(text) => {
-                const t = String(text || "").trim();
-                if (!t) return;
-                const msg = { name: me, text: t, ts: Date.now() };
-                socketRef.current?.emit("chat", msg);
-                addMsg(msg);
-              }}
-            />
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ---------------- SendBox ----------------------------------------------
-function SendBox({ disabled, onSend }) {
-  const [text, setText] = useState("");
-  return (
-    <div className="send">
-      <textarea
-        disabled={disabled}
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        placeholder="Type a message. (Enter to send, Shift+Enter for new line)"
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey) {
-            e.preventDefault();
-            if (text.trim()) onSend(text);
-            setText("");
-          }
-        }}
-      />
-      <button className="btn primary" disabled={disabled} onClick={() => {
-        if (text.trim()) onSend(text);
-        setText("");
-      }}>
-        Send
-      </button>
-    </div>
-  );
-}
+  // prefill code/pin from URL once
+  useEffect(() => {
+    const q = new URLSearchParams(location.search);
+    const c = q.get("code");
+    const p = q.get("pin");
+    if (c) setJoinCode(c);
+    if (p) setJoinPin(p);
+  }, []);
