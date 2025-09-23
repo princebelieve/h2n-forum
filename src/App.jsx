@@ -641,3 +641,202 @@ async function copyInvite() {
   catch { addMsg({ sys: true, ts: Date.now(), text: txt }); }
 }
 
+// === Section 7/8 — JSX UI ==================================================
+
+return (
+  <div className="shell">
+    <div className="glass">
+      <div className="head">
+        <h1>{isHost ? "H2N Forum — Host" : "H2N Forum"}</h1>
+        <span className={`pill ${connected ? "ok" : ""}`}>
+          {connected ? "Connected" : "Disconnected"}
+        </span>
+        <span
+          className="chip"
+          onClick={() => {
+            const n = prompt("Enter your name", me || "");
+            if (n !== null) setMe((n || "").trim() || "Me");
+          }}
+        >
+          <span className="chip-label">You:</span>
+          <span className="chip-name">{me}</span>
+          <span className="chip-edit">✎</span>
+        </span>
+      </div>
+
+      {!room && (
+        <>
+          <div className="row title">Create a meeting</div>
+          <div className="row">
+            <label>Room name</label>
+            <input
+              value={roomName}
+              onChange={(e) => setRoomName(e.target.value)}
+              placeholder="Optional"
+            />
+          </div>
+          <div className="row">
+            <label>PIN</label>
+            <input
+              value={pin}
+              onChange={(e) => setPin(e.target.value)}
+              placeholder="4–6 digits (optional)"
+            />
+          </div>
+          <div className="row">
+            <button className="btn primary" onClick={createRoom}>Create</button>
+          </div>
+
+          <div className="row title">Join with code + PIN</div>
+          <div className="row">
+            <input
+              value={joinCode}
+              onChange={(e) => setJoinCode(e.target.value)}
+              placeholder="6-digit code"
+            />
+            <input
+              value={joinPin}
+              onChange={(e) => setJoinPin(e.target.value)}
+              placeholder="PIN (if required)"
+            />
+            <button className="btn" onClick={joinRoom}>Join</button>
+          </div>
+        </>
+      )}
+
+      {room && (
+        <>
+          <div className="row">
+            <div className="inroom">
+              In room: <b>{room.name || "Room"}</b>{" "}
+              <span style={{ opacity: 0.85 }}>({room.code})</span>
+            </div>
+            <button className="link" onClick={copyInvite}>Copy invite</button>
+            <button className="link" onClick={leaveRoom}>Leave</button>
+          </div>
+
+          <div className="row callbar">
+            {isHost && !inCall && (
+              <button
+                className="btn primary"
+                disabled={starting}
+                onClick={() => startCallHost()}
+              >
+                {starting ? "Starting…" : "Start call"}
+              </button>
+            )}
+            {!isHost && (
+              <button
+                className="btn primary"
+                disabled={!room.live || inCall}
+                onClick={joinCallGuest}
+              >
+                Join call
+              </button>
+            )}
+            <button className="btn" disabled={!inCall} onClick={toggleMute}>
+              {muted ? "Unmute" : "Mute"}
+            </button>
+            <button className="btn" disabled={!inCall} onClick={toggleVideo}>
+              {videoOff ? "Camera On" : "Camera Off"}
+            </button>
+            {isHost && (
+              <button className="btn" onClick={toggleLock}>
+                {room.locked ? "Unlock room" : "Lock room"}
+              </button>
+            )}
+            {isHost && inCall && (
+              <button className="btn danger" onClick={endForAll}>
+                End call for all
+              </button>
+            )}
+            <div className="chk" style={{ marginLeft: "auto" }}>
+              <input
+                type="checkbox"
+                checked={voiceOnly}
+                onChange={(e) => setVoiceOnly(e.target.checked)}
+              />
+              <span>Voice only</span>
+            </div>
+          </div>
+
+          <div className="media single">
+            <div className="remotePane">
+              <video ref={remoteRef} playsInline autoPlay />
+              <video ref={localRef} playsInline autoPlay muted className="pip" />
+            </div>
+          </div>
+        </>
+      )}
+
+      <div className="msgs" ref={msgsRef} style={{ marginTop: 12 }}>
+        {msgs.map((m, i) => (
+          <div key={i} className={`bubble ${m.sys ? "sys" : ""}`}>
+            {m.sys ? (
+              m.text
+            ) : (
+              <>
+                <div className="meta">
+                  <span className="who">{m.name}</span>
+                  <span className="ts">
+                    {new Date(m.ts).toLocaleTimeString()}
+                  </span>
+                </div>
+                <div>{m.text}</div>
+              </>
+            )}
+          </div>
+        ))}
+      </div>
+
+      <SendBox
+        disabled={!room}
+        onSend={(text) => {
+          const t = String(text || "").trim();
+          if (!t) return;
+          const msg = { name: me, text: t, ts: Date.now() };
+          socketRef.current?.emit("chat", msg);
+          addMsg(msg);
+        }}
+      />
+    </div>
+  </div>
+);
+
+// === Section 8/8 — SendBox component & closing ==============================
+
+// Close App component
+}
+
+function SendBox({ disabled, onSend }) {
+  const [text, setText] = useState("");
+  return (
+    <div className="send">
+      <textarea
+        disabled={disabled}
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder="Type a message… (Enter to send, Shift+Enter for new line)"
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            const t = text.trim();
+            if (t) onSend(t);
+            setText("");
+          }
+        }}
+      />
+      <button
+        className="btn primary"
+        disabled={disabled}
+        onClick={() => {
+          const t = text.trim();
+          if (t) onSend(t);
+          setText("");
+        }}
+      >
+        Send
+      </button>
+    </div>
+  );
+}
