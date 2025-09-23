@@ -275,3 +275,367 @@ export default function App() {
     if (c) setJoinCode(c);
     if (p) setJoinPin(p);
   }, []);
+
+  // =========================
+  // Section 4 — Rooms & Calls
+  // =========================
+
+  // ---- rooms ----
+  const createRoom = () => {
+    socketRef.current?.emit("create-room", { name: roomName, pin }, (res) => {
+      if (!res?.ok) return sys("Create failed");
+      setRoom(res.room || {});
+      setRoomName("");
+      setPin("");
+      sys(`Created room: ${res.room?.name} (${res.room?.code})`);
+    });
+  };
+
+  const joinRoom = () => {
+    const code = (joinCode || "").trim();
+    const p = (joinPin || "").trim();
+    if (!code) return;
+    socketRef.current?.emit("join-room", { code, pin: p }, (res) => {
+      if (!res?.ok) return sys(`Join failed: ${res?.error || "unknown"}`);
+      setRoom(res.room || {});
+      sys(`Joined room: ${res.room?.name} (${res.room?.code})`);
+    });
+  };
+
+  const leaveRoom = () => {
+    socketRef.current?.emit("leave-room");
+    setRoom({ code: null, name: null, hostId: null, locked: false, live: false });
+    leaveCall();
+    sys("Left room");
+  };
+
+  const toggleLock = () => {
+    if (!room?.code || room?.hostId !== socketId) return;
+    socketRef.current?.emit("room:lock", !room.locked, (res) => {
+      if (res?.ok) setRoom((r) => ({ ...r, locked: res.locked }));
+    });
+  };
+
+  // ---- calls ----
+
+  // host starts a call (uses latest ready guest if available; otherwise broadcasts)
+  const startCallHost = async () => {
+    if (!room?.code || room?.hostId !== socketId || inCall || starting) return;
+    setStarting(true);
+    stopIncoming(); // stop the ringtone if it was playing
+
+    try {
+      // ensure room is live so guest "Join call" is enabled
+      if (!room.live) {
+        await new Promise((resolve) =>
+          socketRef.current?.emit("room:live", true, () => resolve())
+        );
+        setRoom((r) => ({ ...r, live: true }));
+      }
+
+      const pc = await setupPeer();
+      const ms = await getLocalStream(voiceOnly ? "audio" : "video");
+      ms.getTracks().forEach((t) => pc.addTrack(t, ms));
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      // broadcast offer to room (server will fan out)
+      socketRef.current?.emit("rtc:offer", { offer });
+
+      setInCall(true);
+    } catch (e) {
+      sys("Start call failed");
+      socketRef.current?.emit("room:live", false, () => {});
+      setRoom((r) => ({ ...r, live: false }));
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  // guest announces readiness repeatedly until connected
+  const joinCallGuest = async () => {
+    if (!room?.code || inCall) return;
+
+    // warm permissions so the answer step is smooth
+    try {
+      const tmp = await navigator.mediaDevices.getUserMedia(
+        voiceOnly ? { audio: true, video: false } : { audio: true, video: true }
+      );
+      tmp.getTracks().forEach((t) => t.stop());
+    } catch {
+      return sys("Mic/Camera permission denied");
+    }
+
+    // ringback while waiting for host offer
+    playRingback();
+
+    // announce ready now and every 2s until connected or room goes idle
+    const announce = () => socketRef.current?.emit("rtc:ready", { id: socketRef.current?.id });
+    announce();
+    clearInterval(readyTimerRef.current);
+    readyTimerRef.current = setInterval(() => {
+      if (!inCall && room?.live) announce();
+      else clearInterval(readyTimerRef.current);
+    }, 2000);
+  };
+
+  // host can end for everyone
+  const endForAll = () => {
+    if (!room?.code || room?.hostId !== socketId) return;
+    socketRef.current?.emit("end-for-all");
+    leaveCall();
+  };
+
+  // common teardown
+  const leaveCall = () => {
+    setInCall(false);
+    stopIncoming();
+    stopRingback();
+    clearInterval(readyTimerRef.current);
+
+    const pc = pcRef.current;
+    pcRef.current = null;
+
+    try {
+      if (pc) {
+        pc.getSenders?.().forEach((s) => s.track && s.track.stop?.());
+        pc.getTransceivers?.().forEach((t) => t.stop?.());
+        pc.close?.();
+      }
+    } catch {}
+
+    if (localRef.current?.srcObject) {
+      try { localRef.current.srcObject.getTracks().forEach((t) => t.stop()); } catch {}
+      localRef.current.srcObject = null;
+    }
+    if (remoteRef.current?.srcObject) {
+      try { remoteRef.current.srcObject.getTracks().forEach((t) => t.stop()); } catch {}
+      remoteRef.current.srcObject = null;
+    }
+  };
+
+  // media toggles
+  const toggleMute = () => {
+    const ms = localRef.current?.srcObject;
+    if (!ms) return;
+    ms.getAudioTracks?.().forEach((t) => (t.enabled = !t.enabled));
+    setMuted((m) => !m);
+  };
+
+  const toggleVideo = () => {
+    const ms = localRef.current?.srcObject;
+    if (!ms) return;
+    ms.getVideoTracks?.().forEach((t) => (t.enabled = !t.enabled));
+    setVideoOff((v) => !v);
+  };
+
+  // share invite
+  const copyInvite = async () => {
+    if (!room?.code) return;
+    const url = new URL(location.href);
+    url.searchParams.set("code", room.code);
+    if (room?.pin) url.searchParams.set("pin", room.pin);
+    try {
+      await navigator.clipboard.writeText(url.toString());
+      sys("Invite link copied");
+    } catch {
+      sys(url.toString());
+    }
+  };
+
+// =========================
+  // Section 5 — UI (JSX)
+  // =========================
+  return (
+    <div className="shell">
+      <div className="glass">
+        {/* Header */}
+        <header className="head">
+          <h1>{isHost ? "H2N Forum — Host" : "H2N Forum"}</h1>
+          <span className={`pill ${connected ? "ok" : ""}`}>
+            {connected ? "Connected to server" : "Disconnected"}
+          </span>
+          <button
+            className="chip"
+            onClick={() => {
+              const n = prompt("Enter your name", me || "");
+              if (n !== null) {
+                const v = (n || "").trim() || "Me";
+                setMe(v);
+              }
+            }}
+          >
+            <span className="chip-label">You:</span>{" "}
+            <b className="chip-name">{me}</b>{" "}
+            <span className="chip-edit">✎</span>
+          </button>
+        </header>
+
+        {/* Not in a room: create / join */}
+        {!room?.code && (
+          <>
+            <div className="row title">Create a meeting</div>
+            <div className="row">
+              <label>Room name</label>
+              <input
+                placeholder="Optional"
+                value={roomName}
+                onChange={(e) => setRoomName(e.target.value)}
+              />
+            </div>
+            <div className="row">
+              <label>PIN</label>
+              <input
+                placeholder="4–6 digits (optional)"
+                value={pin}
+                onChange={(e) => setPin(e.target.value)}
+              />
+            </div>
+            <div className="row">
+              <button className="btn primary" onClick={createRoom}>Create</button>
+            </div>
+
+            <div className="row title right">Code + optional PIN</div>
+            <div className="row">
+              <input
+                placeholder="6-digit code"
+                value={joinCode}
+                onChange={(e) => setJoinCode(e.target.value)}
+              />
+              <input
+                placeholder="PIN (if required)"
+                value={joinPin}
+                onChange={(e) => setJoinPin(e.target.value)}
+              />
+              <button className="btn" onClick={joinRoom}>Join</button>
+            </div>
+
+            <div className="hint">
+              Rooms auto-delete after being empty for a while. Share the code (and PIN if set).
+            </div>
+          </>
+        )}
+
+        {/* In a room */}
+        {room?.code && (
+          <>
+            <div className="row">
+              <div className="inroom">
+                In room: <b>{room.name || "Room"}</b>{" "}
+                <span className="mono">({room.code})</span>
+                <button className="link" onClick={copyInvite}>Copy invite</button>
+                <button className="link" onClick={leaveRoom}>Leave</button>
+              </div>
+            </div>
+
+            {/* Call controls */}
+            <div className="row callbar">
+              {/* Host controls */}
+              {isHost && !inCall && (
+                <button
+                  className="btn primary"
+                  onClick={startCallHost}
+                  disabled={starting}
+                >
+                  {starting ? "Starting…" : "Start call"}
+                </button>
+              )}
+
+              {/* Guest controls */}
+              {!isHost && (
+                <button
+                  className="btn primary"
+                  onClick={joinCallGuest}
+                  disabled={inCall || !room.live}
+                >
+                  Join call
+                </button>
+              )}
+
+              <button className="btn" onClick={toggleMute} disabled={!inCall}>
+                {muted ? "Unmute" : "Mute"}
+              </button>
+              <button
+                className="btn"
+                onClick={toggleVideo}
+                disabled={!inCall || voiceOnly}
+              >
+                {videoOff ? "Camera On" : "Camera Off"}
+              </button>
+
+              {isHost && (
+                <button className="btn" onClick={toggleLock}>
+                  {room.locked ? "Unlock room" : "Lock room"}
+                </button>
+              )}
+              {isHost && inCall && (
+                <button className="btn danger" onClick={endForAll}>
+                  End call for all
+                </button>
+              )}
+
+              <label className="chk">
+                <input
+                  type="checkbox"
+                  checked={voiceOnly}
+                  onChange={(e) => e && setVoiceOnly(e.target.checked)}
+                />
+                <span>Voice only</span>
+              </label>
+            </div>
+
+            {!isHost && !room.live && (
+              <div className="hint">Waiting for host to start the call…</div>
+            )}
+
+            {/* Media area */}
+            <div className="media single">
+              <div className="remotePane">
+                <video ref={remoteRef} autoPlay playsInline />
+                <video ref={localRef} autoPlay playsInline muted className="pip" />
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* Messages */}
+        <div className="msgs" ref={msgsRef}>
+          {msgs.length === 0 ? (
+            <div className="muted">No messages yet. Say hi! 👋</div>
+          ) : (
+            msgs.map((m, i) => (
+              <div key={i} className={`bubble ${m.sys ? "sys" : ""}`}>
+                {m.sys ? (
+                  <div className="text">{m.text}</div>
+                ) : (
+                  <>
+                    <div className="meta">
+                      <span className="who">{m.name}</span>
+                      <span className="ts">
+                        {new Date(m.ts).toLocaleTimeString()}
+                      </span>
+                    </div>
+                    <div className="text">{m.text}</div>
+                  </>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+
+        {/* Send box */}
+        <SendBox
+          disabled={!room?.code}
+          onSend={(text) => {
+            const t = String(text || "").trim();
+            if (!t) return;
+            const msg = { name: me, text: t, ts: Date.now() };
+            socketRef.current?.emit("chat", msg);
+            addMsg(msg);
+          }}
+        />
+      </div>
+    </div>
+  );
+} // <-- closes App()
